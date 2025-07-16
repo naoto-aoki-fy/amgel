@@ -1,1 +1,1 @@
-# A's Multi-GPUs emulation layer
+# A's Multi-Gpus Emulation Layer
