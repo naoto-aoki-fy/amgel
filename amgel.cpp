@@ -13,9 +13,11 @@
 #include <atlc/check_x.hpp>
 #include <atlc/check_mpi.hpp>
 #include <atlc/check_cuda.hpp>
-#include <cdl.h> /* should be after atlc*/
+#include <frida-gum.h>
 
 namespace amgel {
+
+    static GumInterceptor *interceptor = NULL;
 
     decltype(&::cudaIpcGetMemHandle) cudaIpcGetMemHandle;
     decltype(&::cudaIpcOpenMemHandle) cudaIpcOpenMemHandle;
@@ -46,28 +48,13 @@ namespace amgel {
         std::vector<uint64_t> pointer_list;
 
         decltype(&::cudaMalloc<void>) origCudaMalloc;
-        struct cdl_jmp_patch jmpPatchCudaMalloc;
-
         decltype(&::cudaSetDevice) origCudaSetDevice;
-        struct cdl_jmp_patch jmpPatchCudaSetDevice;
-
         decltype(&::ncclGetUniqueId) origNcclGetUniqueId;
-        struct cdl_jmp_patch jmpPatchNcclGetUniqueId;
-
         decltype(&::ncclCommInitRank) origNcclCommInitRank;
-        struct cdl_jmp_patch jmpPatchNcclCommInitRank;
-
         decltype(&::ncclGroupStart) origNcclGroupStart;
-        struct cdl_jmp_patch jmpPatchNcclGroupStart;
-
         decltype(&::ncclGroupEnd) origNcclGroupEnd;
-        struct cdl_jmp_patch jmpPatchNcclGroupEnd;
-
         decltype(&::ncclSend) origNcclSend;
-        struct cdl_jmp_patch jmpPatchNcclSend;
-
         decltype(&::ncclRecv) origNcclRecv;
-        struct cdl_jmp_patch jmpPatchNcclRecv;
     };
 
     static amgel::commStruct commStructPrivate;
@@ -273,6 +260,10 @@ namespace amgel {
     __attribute__((constructor))
     void init() {
 
+        gum_init_embedded();
+        interceptor = gum_interceptor_obtain();
+        gum_interceptor_begin_transaction(interceptor);
+
         cudaIpcGetMemHandle = &::cudaIpcGetMemHandle;
         cudaIpcOpenMemHandle = &::cudaIpcOpenMemHandle;
         cudaIpcCloseMemHandle = &::cudaIpcCloseMemHandle;
@@ -285,32 +276,43 @@ namespace amgel {
         if (!amgel::commStructPrivate.origCudaMalloc) {
             amgel::commStructPrivate.origCudaMalloc = (cudaError_t (*)(void **, size_t))dlsym(exe, "cudaMalloc");
         }
-        amgel::commStructPrivate.jmpPatchCudaMalloc = cdl_jmp_attach((void**)&amgel::commStructPrivate.origCudaMalloc, (void**)amgel::cudaMalloc);
+        gum_interceptor_replace(amgel::interceptor, (gpointer)amgel::commStructPrivate.origCudaMalloc, (gpointer)amgel::cudaMalloc, NULL, (gpointer*)&amgel::commStructPrivate.origCudaMalloc);
 
         amgel::commStructPrivate.origCudaSetDevice = (cudaError_t (*)(int))find_symbol_offset("/proc/self/exe", "cudaSetDevice");
         if (!amgel::commStructPrivate.origCudaSetDevice) {
             amgel::commStructPrivate.origCudaSetDevice = (cudaError_t (*)(int))dlsym(exe, "cudaSetDevice");
         }
-
-        amgel::commStructPrivate.jmpPatchCudaSetDevice = cdl_jmp_attach((void**)&amgel::commStructPrivate.origCudaSetDevice, (void**)amgel::cudaSetDevice);
+        gum_interceptor_replace(amgel::interceptor, (gpointer)amgel::commStructPrivate.origCudaSetDevice, (gpointer)amgel::cudaSetDevice, NULL, (gpointer*)&amgel::commStructPrivate.origCudaSetDevice);
 
         amgel::commStructPrivate.origNcclGetUniqueId = ncclGetUniqueId;
-        amgel::commStructPrivate.jmpPatchNcclGetUniqueId = cdl_jmp_attach((void**)&amgel::commStructPrivate.origNcclGetUniqueId, (void**)amgel::getUniqueId);
+        gum_interceptor_replace(amgel::interceptor, (gpointer)amgel::commStructPrivate.origNcclGetUniqueId, (gpointer)amgel::getUniqueId, NULL, (gpointer*)&amgel::commStructPrivate.origNcclGetUniqueId);
 
         amgel::commStructPrivate.origNcclCommInitRank = ncclCommInitRank;
-        amgel::commStructPrivate.jmpPatchNcclCommInitRank = cdl_jmp_attach((void**)&amgel::commStructPrivate.origNcclCommInitRank, (void**)amgel::commInitRank);
+        gum_interceptor_replace(amgel::interceptor, (gpointer)amgel::commStructPrivate.origNcclCommInitRank, (gpointer)amgel::commInitRank, NULL, (gpointer*)&amgel::commStructPrivate.origNcclCommInitRank);
 
         amgel::commStructPrivate.origNcclGroupStart = ncclGroupStart;
-        amgel::commStructPrivate.jmpPatchNcclGroupStart = cdl_jmp_attach((void**)&amgel::commStructPrivate.origNcclGroupStart, (void**)amgel::groupStart);
+        gum_interceptor_replace(amgel::interceptor, (gpointer)amgel::commStructPrivate.origNcclGroupStart, (gpointer)amgel::groupStart, NULL, (gpointer*)&amgel::commStructPrivate.origNcclGroupStart);
 
         amgel::commStructPrivate.origNcclGroupEnd = ncclGroupEnd;
-        amgel::commStructPrivate.jmpPatchNcclGroupEnd = cdl_jmp_attach((void**)&amgel::commStructPrivate.origNcclGroupEnd, (void**)amgel::groupEnd);
+        gum_interceptor_replace(amgel::interceptor, (gpointer)amgel::commStructPrivate.origNcclGroupEnd, (gpointer)amgel::groupEnd, NULL, (gpointer*)&amgel::commStructPrivate.origNcclGroupEnd);
 
         amgel::commStructPrivate.origNcclSend = ncclSend;
-        amgel::commStructPrivate.jmpPatchNcclSend = cdl_jmp_attach((void**)&amgel::commStructPrivate.origNcclSend, (void**)amgel::send);
+        gum_interceptor_replace(amgel::interceptor, (gpointer)amgel::commStructPrivate.origNcclSend, (gpointer)amgel::send, NULL, (gpointer*)&amgel::commStructPrivate.origNcclSend);
 
         amgel::commStructPrivate.origNcclRecv = ncclRecv;
-        amgel::commStructPrivate.jmpPatchNcclRecv = cdl_jmp_attach((void**)&amgel::commStructPrivate.origNcclRecv, (void**)amgel::recv);
+        gum_interceptor_replace(amgel::interceptor, (gpointer)amgel::commStructPrivate.origNcclRecv, (gpointer)amgel::recv, NULL, (gpointer*)&amgel::commStructPrivate.origNcclRecv);
+
+        gum_interceptor_end_transaction(interceptor);
+    }
+
+    __attribute__((destructor))
+    void deinit() {
+        gum_interceptor_begin_transaction(interceptor);
+        // gum_interceptor_revert(interceptor, (void*)(func));  /* specify original address */
+        gum_interceptor_end_transaction(interceptor);
+    
+        g_object_unref(interceptor);
+        gum_deinit_embedded();
     }
 
 }
