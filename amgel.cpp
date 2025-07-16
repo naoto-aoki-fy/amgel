@@ -257,6 +257,12 @@ namespace amgel {
         return 0;
     } 
 
+    static void* find_symbol_offset_or_dlsym(char const* exe_path, const char* symbol_name) {
+        void* addr = find_symbol_offset(exe_path, symbol_name);
+        if (addr) { return addr; }
+        return dlsym(NULL, symbol_name);
+    }
+
     __attribute__((constructor))
     void init() {
 
@@ -272,16 +278,10 @@ namespace amgel {
 
         void *exe = NULL;
 
-        amgel::commStructPrivate.origCudaMalloc = (cudaError_t (*)(void **, size_t))find_symbol_offset("/proc/self/exe", "cudaMalloc");
-        if (!amgel::commStructPrivate.origCudaMalloc) {
-            amgel::commStructPrivate.origCudaMalloc = (cudaError_t (*)(void **, size_t))dlsym(exe, "cudaMalloc");
-        }
+        amgel::commStructPrivate.origCudaMalloc = (cudaError_t (*)(void **, size_t))find_symbol_offset_or_dlsym("/proc/self/exe", "cudaMalloc");
         gum_interceptor_replace(amgel::interceptor, (gpointer)amgel::commStructPrivate.origCudaMalloc, (gpointer)amgel::cudaMalloc, NULL, (gpointer*)&amgel::commStructPrivate.origCudaMalloc);
 
-        amgel::commStructPrivate.origCudaSetDevice = (cudaError_t (*)(int))find_symbol_offset("/proc/self/exe", "cudaSetDevice");
-        if (!amgel::commStructPrivate.origCudaSetDevice) {
-            amgel::commStructPrivate.origCudaSetDevice = (cudaError_t (*)(int))dlsym(exe, "cudaSetDevice");
-        }
+        amgel::commStructPrivate.origCudaSetDevice = (cudaError_t (*)(int))find_symbol_offset_or_dlsym("/proc/self/exe", "cudaSetDevice");
         gum_interceptor_replace(amgel::interceptor, (gpointer)amgel::commStructPrivate.origCudaSetDevice, (gpointer)amgel::cudaSetDevice, NULL, (gpointer*)&amgel::commStructPrivate.origCudaSetDevice);
 
         amgel::commStructPrivate.origNcclGetUniqueId = ncclGetUniqueId;
