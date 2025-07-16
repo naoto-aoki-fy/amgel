@@ -23,22 +23,6 @@ namespace amgel {
     decltype(&::cudaMemcpyAsync) cudaMemcpyAsync;
     decltype(&::cudaStreamSynchronize) cudaStreamSynchronize;
 
-    // cudaError_t cudaIpcGetMemHandle(cudaIpcMemHandle_t* handle, void* devPtr) {
-    //     return ::cudaIpcGetMemHandle(handle, devPtr);
-    // }
-    // cudaError_t cudaIpcOpenMemHandle(void** devPtr, cudaIpcMemHandle_t handle, unsigned int flags) {
-    //     return ::cudaIpcOpenMemHandle(devPtr, handle, flags);
-    // }
-    // cudaError_t cudaIpcCloseMemHandle(void* devPtr) {
-    //     return ::cudaIpcCloseMemHandle(devPtr);
-    // }
-    // cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t count, cudaMemcpyKind kind, cudaStream_t stream = 0) {
-    //     return ::cudaMemcpyAsync(dst, src, count, kind, stream);
-    // }
-    // cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
-    //     return ::cudaStreamSynchronize(stream);
-    // }
-
     typedef struct {
         cudaIpcMemHandle_t handle;
         uint64_t offset;
