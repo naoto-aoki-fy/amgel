@@ -45,28 +45,28 @@ namespace amgel {
         std::vector<MPI_Request> mpi_request_list;
         std::vector<uint64_t> pointer_list;
 
+        decltype(&::cudaMalloc<void>) origCudaMalloc;
         struct cdl_jmp_patch jmpPatchCudaMalloc;
-        cudaError_t (*origCudaMalloc)(void **, size_t);
 
+        decltype(&::cudaSetDevice) origCudaSetDevice;
         struct cdl_jmp_patch jmpPatchCudaSetDevice;
-        cudaError_t (*origCudaSetDevice)(int);
 
-        void* origNcclGetUniqueId;
+        decltype(&::ncclGetUniqueId) origNcclGetUniqueId;
         struct cdl_jmp_patch jmpPatchNcclGetUniqueId;
 
-        void* origNcclCommInitRank;
+        decltype(&::ncclCommInitRank) origNcclCommInitRank;
         struct cdl_jmp_patch jmpPatchNcclCommInitRank;
 
-        void* origNcclGroupStart;
+        decltype(&::ncclGroupStart) origNcclGroupStart;
         struct cdl_jmp_patch jmpPatchNcclGroupStart;
 
-        void* origNcclGroupEnd;
+        decltype(&::ncclGroupEnd) origNcclGroupEnd;
         struct cdl_jmp_patch jmpPatchNcclGroupEnd;
 
-        void* origNcclSend;
+        decltype(&::ncclSend) origNcclSend;
         struct cdl_jmp_patch jmpPatchNcclSend;
 
-        void* origNcclRecv;
+        decltype(&::ncclRecv) origNcclRecv;
         struct cdl_jmp_patch jmpPatchNcclRecv;
     };
 
@@ -294,22 +294,22 @@ namespace amgel {
 
         amgel::commStructPrivate.jmpPatchCudaSetDevice = cdl_jmp_attach((void**)&amgel::commStructPrivate.origCudaSetDevice, (void**)amgel::cudaSetDevice);
 
-        amgel::commStructPrivate.origNcclGetUniqueId = (void*)ncclGetUniqueId;
+        amgel::commStructPrivate.origNcclGetUniqueId = ncclGetUniqueId;
         amgel::commStructPrivate.jmpPatchNcclGetUniqueId = cdl_jmp_attach((void**)&amgel::commStructPrivate.origNcclGetUniqueId, (void**)amgel::getUniqueId);
 
-        amgel::commStructPrivate.origNcclCommInitRank = (void*)ncclCommInitRank;
+        amgel::commStructPrivate.origNcclCommInitRank = ncclCommInitRank;
         amgel::commStructPrivate.jmpPatchNcclCommInitRank = cdl_jmp_attach((void**)&amgel::commStructPrivate.origNcclCommInitRank, (void**)amgel::commInitRank);
 
-        amgel::commStructPrivate.origNcclGroupStart = (void*)ncclGroupStart;
+        amgel::commStructPrivate.origNcclGroupStart = ncclGroupStart;
         amgel::commStructPrivate.jmpPatchNcclGroupStart = cdl_jmp_attach((void**)&amgel::commStructPrivate.origNcclGroupStart, (void**)amgel::groupStart);
 
-        amgel::commStructPrivate.origNcclGroupEnd = (void*)ncclGroupEnd;
+        amgel::commStructPrivate.origNcclGroupEnd = ncclGroupEnd;
         amgel::commStructPrivate.jmpPatchNcclGroupEnd = cdl_jmp_attach((void**)&amgel::commStructPrivate.origNcclGroupEnd, (void**)amgel::groupEnd);
 
-        amgel::commStructPrivate.origNcclSend = (void*)ncclSend;
+        amgel::commStructPrivate.origNcclSend = ncclSend;
         amgel::commStructPrivate.jmpPatchNcclSend = cdl_jmp_attach((void**)&amgel::commStructPrivate.origNcclSend, (void**)amgel::send);
 
-        amgel::commStructPrivate.origNcclRecv = (void*)ncclRecv;
+        amgel::commStructPrivate.origNcclRecv = ncclRecv;
         amgel::commStructPrivate.jmpPatchNcclRecv = cdl_jmp_attach((void**)&amgel::commStructPrivate.origNcclRecv, (void**)amgel::recv);
     }
 
