@@ -10,10 +10,12 @@
 #include <mpi.h>
 #include <cuda_runtime.h>
 #include <nccl.h>
+#include <frida-gum.h>
+
 #include <atlc/check_x.hpp>
 #include <atlc/check_mpi.hpp>
 #include <atlc/check_cuda.hpp>
-#include <frida-gum.h>
+#include <atlc/check_frida.hpp>
 
 namespace amgel {
 
@@ -276,23 +278,21 @@ namespace amgel {
         cudaMemcpyAsync = &::cudaMemcpyAsync;
         cudaStreamSynchronize = &::cudaStreamSynchronize;
 
-        void *exe = NULL;
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)find_symbol_offset_or_dlsym("/proc/self/exe", "cudaMalloc"), (gpointer)amgel::cudaMalloc, NULL, (gpointer*)&amgel::commStructPrivate.origCudaMalloc);
 
-        gum_interceptor_replace(amgel::interceptor, (gpointer)find_symbol_offset_or_dlsym("/proc/self/exe", "cudaMalloc"), (gpointer)amgel::cudaMalloc, NULL, (gpointer*)&amgel::commStructPrivate.origCudaMalloc);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)find_symbol_offset_or_dlsym("/proc/self/exe", "cudaSetDevice"), (gpointer)amgel::cudaSetDevice, NULL, (gpointer*)&amgel::commStructPrivate.origCudaSetDevice);
 
-        gum_interceptor_replace(amgel::interceptor, (gpointer)find_symbol_offset_or_dlsym("/proc/self/exe", "cudaSetDevice"), (gpointer)amgel::cudaSetDevice, NULL, (gpointer*)&amgel::commStructPrivate.origCudaSetDevice);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclGetUniqueId, (gpointer)amgel::getUniqueId, NULL, (gpointer*)&amgel::commStructPrivate.origNcclGetUniqueId);
 
-        gum_interceptor_replace(amgel::interceptor, (gpointer)ncclGetUniqueId, (gpointer)amgel::getUniqueId, NULL, (gpointer*)&amgel::commStructPrivate.origNcclGetUniqueId);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclCommInitRank, (gpointer)amgel::commInitRank, NULL, (gpointer*)&amgel::commStructPrivate.origNcclCommInitRank);
 
-        gum_interceptor_replace(amgel::interceptor, (gpointer)ncclCommInitRank, (gpointer)amgel::commInitRank, NULL, (gpointer*)&amgel::commStructPrivate.origNcclCommInitRank);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclGroupStart, (gpointer)amgel::groupStart, NULL, (gpointer*)&amgel::commStructPrivate.origNcclGroupStart);
 
-        gum_interceptor_replace(amgel::interceptor, (gpointer)ncclGroupStart, (gpointer)amgel::groupStart, NULL, (gpointer*)&amgel::commStructPrivate.origNcclGroupStart);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclGroupEnd, (gpointer)amgel::groupEnd, NULL, (gpointer*)&amgel::commStructPrivate.origNcclGroupEnd);
 
-        gum_interceptor_replace(amgel::interceptor, (gpointer)ncclGroupEnd, (gpointer)amgel::groupEnd, NULL, (gpointer*)&amgel::commStructPrivate.origNcclGroupEnd);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclSend, (gpointer)amgel::send, NULL, (gpointer*)&amgel::commStructPrivate.origNcclSend);
 
-        gum_interceptor_replace(amgel::interceptor, (gpointer)ncclSend, (gpointer)amgel::send, NULL, (gpointer*)&amgel::commStructPrivate.origNcclSend);
-
-        gum_interceptor_replace(amgel::interceptor, (gpointer)ncclRecv, (gpointer)amgel::recv, NULL, (gpointer*)&amgel::commStructPrivate.origNcclRecv);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclRecv, (gpointer)amgel::recv, NULL, (gpointer*)&amgel::commStructPrivate.origNcclRecv);
 
         gum_interceptor_end_transaction(interceptor);
     }
