@@ -1,31 +1,25 @@
-// nvcc -shared -Xcompiler -fPIC -std=c++17 -lmpi -lnccl -lelf -rdc=true --cudart=none -I./cdl86 ./mynccl.cpp ./cdl86/cdl.c -o mynccl.so
-
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 
-#include <stdint.h>
-#include <mpi.h>
-#include <cuda_runtime.h>
-#include <nccl.h>
-
-#include <atlc/check_x.hpp>
-#include <atlc/check_mpi.hpp>
-#include <atlc/check_cuda.hpp>
-
+#include <dlfcn.h>
 #include <libelf.h>
 #include <gelf.h>
 #include <fcntl.h>
 
-#include <cdl.h>
-
-#include <dlfcn.h>
+#include <mpi.h>
+#include <cuda_runtime.h>
+#include <nccl.h>
+#include <atlc/check_x.hpp>
+#include <atlc/check_mpi.hpp>
+#include <atlc/check_cuda.hpp>
+#include <cdl.h> /* should be after atlc*/
 
 #define myncclCudaIpcGetMemHandle cudaIpcGetMemHandle
 #define myncclCudaIpcOpenMemHandle cudaIpcOpenMemHandle
 #define myncclCudaIpcCloseMemHandle cudaIpcCloseMemHandle
 #define myncclCudaMemcpyAsync cudaMemcpyAsync
 #define myncclCudaStreamSynchronize cudaStreamSynchronize
-
 
 typedef struct {
     cudaIpcMemHandle_t handle;
@@ -74,19 +68,15 @@ struct myncclCommStruct {
     struct cdl_jmp_patch jmpPatchNcclRecv;
 };
 
-// typedef myncclCommStruct* ncclComm_t;
-
 static myncclCommStruct myncclCommStructPrivate;
 
 static cudaError_t myncclCudaMalloc(void **devPtr, size_t size) {
-    // fprintf(stderr, "debug: myncclCudaMalloc\n");
     cudaError_t const ret = myncclCommStructPrivate.origCudaMalloc(devPtr, size);
     myncclCommStructPrivate.pointer_list.push_back((uint64_t)*devPtr);
     return ret;
 }
 
 static cudaError_t myncclCudaSetDevice(int device) {
-    // fprintf(stderr, "debug: myncclCudaSetDevice\n");
     cudaError_t const ret = myncclCommStructPrivate.origCudaSetDevice(0);
     return ret;
 
@@ -112,7 +102,6 @@ static inline uint64_t myncclSizeofNcclDataType(int datatype) {
 }
 
 static ncclResult_t myncclGetUniqueId(ncclUniqueId* nccl_id) {
-    // fprintf(stderr, "debug: myncclGetUniqueId\n");
     *(int*)nccl_id = 1;
     return ncclSuccess;
 }
@@ -140,14 +129,12 @@ void* myncclGetClosestPointer(void* pointer_input, uint64_t* offset) {
 }
 
 static ncclResult_t myncclCommInitRank(ncclComm_t* comm, int ndev, ncclUniqueId nccl_id, int rank) {
-    // fprintf(stderr, "debug: myncclCommInitRank\n");
     *comm = (ncclComm_t)(void*)&myncclCommStructPrivate;
     myncclCommStructPrivate.in_group = false;
     return ncclSuccess;
 }
 
 static ncclResult_t myncclGroupStart() {
-    // fprintf(stderr, "debug: myncclGroupStart\n");
     myncclCommStructPrivate.send_args.clear();
     myncclCommStructPrivate.recv_args.clear();
     myncclCommStructPrivate.src_buff_handle_list.clear();
@@ -158,28 +145,22 @@ static ncclResult_t myncclGroupStart() {
 }
 
 static ncclResult_t myncclGroupEnd() {
-    // fprintf(stderr, "debug: myncclGroupEnd\n");
     if (!myncclCommStructPrivate.in_group) {
         return ncclInvalidUsage;
     }
 
-    // fprintf(stderr, "debug: %d\n", __LINE__);
     myncclCommStructPrivate.mpi_request_list.resize(myncclCommStructPrivate.send_args.size() + myncclCommStructPrivate.recv_args.size());
     int mpi_request_idx = 0;
 
-    // fprintf(stderr, "debug: %d\n", __LINE__);
     /* get memhandle and send it to peer */
     for (size_t i = 0; i < myncclCommStructPrivate.send_args.size(); ++i) {
-        // fprintf(stderr, "[debug] myncclCommStructPrivate.send_args[i].buff=%p\n", myncclCommStructPrivate.send_args[i].buff);
         myncclHandleOffset handle_offset;
         void* const buffer = myncclGetClosestPointer(myncclCommStructPrivate.send_args[i].buff, &handle_offset.offset);
-        // fprintf(stderr, "[debug] myncclGetClosestPointer=%p offset=%p\n", buffer, handle_offset.offset);
         ATLC_CHECK_CUDA(myncclCudaIpcGetMemHandle, &handle_offset.handle, buffer);
         ATLC_CHECK_MPI(MPI_Isend, &handle_offset, sizeof(myncclHandleOffset), MPI_BYTE, myncclCommStructPrivate.send_args[i].peer, 0, MPI_COMM_WORLD, &myncclCommStructPrivate.mpi_request_list[mpi_request_idx]);
         mpi_request_idx++;
     }
 
-    // fprintf(stderr, "debug: %d\n", __LINE__);
     /* recv memhandle from peer */
     myncclCommStructPrivate.src_buff_handle_list.resize(myncclCommStructPrivate.recv_args.size());
     for (size_t i = 0; i < myncclCommStructPrivate.send_args.size(); ++i) {
@@ -187,17 +168,14 @@ static ncclResult_t myncclGroupEnd() {
         mpi_request_idx++;
     }
 
-    // fprintf(stderr, "debug: %d\n", __LINE__);
     /* wait for all send/recv requests to finish */
     ATLC_CHECK_MPI(MPI_Waitall, myncclCommStructPrivate.mpi_request_list.size(), myncclCommStructPrivate.mpi_request_list.data(), MPI_STATUSES_IGNORE);
 
-    // fprintf(stderr, "debug: %d\n", __LINE__);
     /* open memhandle and copy data */
     myncclCommStructPrivate.src_buff_list.resize(myncclCommStructPrivate.src_buff_handle_list.size());
     for (size_t i = 0; i < myncclCommStructPrivate.src_buff_handle_list.size(); ++i) {
         // fprintf(stderr, "debug: %d\n", __LINE__);
         ATLC_CHECK_CUDA(myncclCudaIpcOpenMemHandle, &myncclCommStructPrivate.src_buff_list[i], myncclCommStructPrivate.src_buff_handle_list[i].handle, cudaIpcMemLazyEnablePeerAccess);
-        // fprintf(stderr, "debug: %d\n", __LINE__);
         ATLC_CHECK_CUDA(
             myncclCudaMemcpyAsync,
             myncclCommStructPrivate.recv_args[i].buff,
@@ -207,10 +185,8 @@ static ncclResult_t myncclGroupEnd() {
             cudaMemcpyDeviceToDevice,
             myncclCommStructPrivate.recv_args[i].stream
         );
-        // fprintf(stderr, "debug: %d\n", __LINE__);
     }
 
-    // fprintf(stderr, "debug: %d\n", __LINE__);
     /* synchronize streams */
     ATLC_CHECK_CUDA(myncclCudaStreamSynchronize, myncclCommStructPrivate.recv_args[0].stream);
     for (size_t i = 1; i < myncclCommStructPrivate.send_args.size(); ++i) {
@@ -219,7 +195,6 @@ static ncclResult_t myncclGroupEnd() {
         }
     }
 
-    // fprintf(stderr, "debug: %d\n", __LINE__);
     /* close memhandle */
     for (size_t i = 0; i < myncclCommStructPrivate.src_buff_list.size(); ++i) {
         ATLC_CHECK_CUDA(myncclCudaIpcCloseMemHandle, myncclCommStructPrivate.src_buff_list[i]);
@@ -227,7 +202,6 @@ static ncclResult_t myncclGroupEnd() {
 
     /* free send/recv args */
 
-    // fprintf(stderr, "debug: %d\n", __LINE__);
     /* synchronize */
     ATLC_CHECK_MPI(MPI_Barrier, MPI_COMM_WORLD);
 
@@ -236,7 +210,6 @@ static ncclResult_t myncclGroupEnd() {
 }
 
 static ncclResult_t myncclSend(void* sendbuff, uint64_t count, int datatype, int peer, myncclCommStruct* comm, cudaStream_t stream) {
-    // fprintf(stderr, "debug: myncclSend\n");
     if (comm->in_group) {
         comm->send_args.push_back({sendbuff, count, datatype, peer, stream});
     } else {
@@ -251,7 +224,6 @@ static ncclResult_t myncclSend(void* sendbuff, uint64_t count, int datatype, int
 }
 
 static ncclResult_t myncclRecv(void* recvbuff, uint64_t count, int datatype, int peer, myncclCommStruct* comm, cudaStream_t stream) {
-    // fprintf(stderr, "debug: myncclRecv\n");
     if (comm->in_group) {
         comm->recv_args.push_back({recvbuff, count, datatype, peer, stream});
     } else {
@@ -265,14 +237,6 @@ static ncclResult_t myncclRecv(void* recvbuff, uint64_t count, int datatype, int
     }
     return ncclSuccess;
 }
-
-// __attribute__((constructor))
-// static void hoge() {
-//     fprintf(stderr, "debug: hello\n");
-// }
-
-
-
 
 static void* find_symbol_offset(const char* exe_path, const char* symbol_name) {
     int fd = open(exe_path, O_RDONLY);
@@ -304,57 +268,22 @@ static void* find_symbol_offset(const char* exe_path, const char* symbol_name) {
     return 0;
 } 
 
-
-// extern "C"
 __attribute__((constructor))
 void myncclPatch() {
 
-
-    // fprintf(stderr, "debug: myncclPatch\n");
-    // void *cudart = RTLD_NEXT;
-    // void *cudart = dlopen("libcudart.so", RTLD_NOW);
     void *exe = NULL; // dlopen("/proc/self/exe", RTLD_NOW)
 
-    // myncclCudaIpcGetMemHandle = (cudaError_t (*)(cudaIpcMemHandle_t*, void*))dlsym(cudart, "cudaIpcGetMemHandle");
-    // // fprintf(stderr, "debug: myncclCudaIpcGetMemHandle=%p\n", myncclCudaIpcGetMemHandle);
-    // myncclCudaIpcOpenMemHandle = (cudaError_t (*)(void**, cudaIpcMemHandle_t, unsigned int))dlsym(cudart, "cudaIpcOpenMemHandle");
-    // // fprintf(stderr, "debug: myncclCudaIpcOpenMemHandle=%p\n", myncclCudaIpcOpenMemHandle);
-    // myncclCudaIpcCloseMemHandle = (cudaError_t (*)(void*))dlsym(cudart, "cudaIpcCloseMemHandle");
-    // // fprintf(stderr, "debug: myncclCudaIpcCloseMemHandle=%p\n", myncclCudaIpcCloseMemHandle);
-    // myncclCudaMemcpyAsync = (cudaError_t (*)(void*, const void*, size_t, cudaMemcpyKind, cudaStream_t))dlsym(cudart, "cudaMemcpyAsync");
-    // myncclCudaStreamSynchronize = (cudaError_t (*)(cudaStream_t))dlsym(cudart, "cudaStreamSynchronize");
-
-    // myncclCudaIpcGetMemHandle = (cudaError_t (*)(cudaIpcMemHandle_t*, void*))::cudaIpcGetMemHandle;
-    // myncclCudaIpcOpenMemHandle = (cudaError_t (*)(void**, cudaIpcMemHandle_t, unsigned int))::cudaIpcOpenMemHandle;
-    // myncclCudaIpcCloseMemHandle = (cudaError_t (*)(void*))::cudaIpcCloseMemHandle;
-    // myncclCudaMemcpyAsync = (cudaError_t (*)(void*, const void*, size_t, cudaMemcpyKind, cudaStream_t))::cudaMemcpyAsync;
-    // myncclCudaStreamSynchronize = (cudaError_t (*)(cudaStream_t))::cudaStreamSynchronize;
-
-    // fprintf(stderr, "debug: ::cudaMalloc=%p\n", (cudaError_t (*)(void **, size_t))::cudaMalloc);
-    // myncclCommStructPrivate.origCudaMalloc = (cudaError_t (*)(void **, size_t))::cudaMalloc;
-    // myncclCommStructPrivate.origCudaMalloc = (cudaError_t (*)(void **, size_t))dlsym(exe, "cudaMalloc");
-    // if (!myncclCommStructPrivate.origCudaMalloc) {
-    //     myncclCommStructPrivate.origCudaMalloc = (cudaError_t (*)(void **, size_t))find_symbol_offset("/proc/self/exe", "cudaMalloc");
-    // }
     myncclCommStructPrivate.origCudaMalloc = (cudaError_t (*)(void **, size_t))find_symbol_offset("/proc/self/exe", "cudaMalloc");
     if (!myncclCommStructPrivate.origCudaMalloc) {
         myncclCommStructPrivate.origCudaMalloc = (cudaError_t (*)(void **, size_t))dlsym(exe, "cudaMalloc");
     }
-    // fprintf(stderr, "debug: origCudaMalloc=%p\n", myncclCommStructPrivate.origCudaMalloc);
-    // myncclCommStructPrivate.origCudaMalloc = (cudaError_t (*)(void **, size_t))0x45b170;
     myncclCommStructPrivate.jmpPatchCudaMalloc = cdl_jmp_attach((void**)&myncclCommStructPrivate.origCudaMalloc, (void**)myncclCudaMalloc);
 
-    // myncclCommStructPrivate.origCudaSetDevice = (cudaError_t (*)(int))::cudaSetDevice;
-    // myncclCommStructPrivate.origCudaSetDevice = (cudaError_t (*)(int))0x4526d0;
-    // myncclCommStructPrivate.origCudaSetDevice = (cudaError_t (*)(int))dlsym(exe, "cudaSetDevice");
-    // if (!myncclCommStructPrivate.origCudaSetDevice) {
-    //     myncclCommStructPrivate.origCudaSetDevice = (cudaError_t (*)(int))find_symbol_offset("/proc/self/exe", "cudaSetDevice");
-    // }
     myncclCommStructPrivate.origCudaSetDevice = (cudaError_t (*)(int))find_symbol_offset("/proc/self/exe", "cudaSetDevice");
     if (!myncclCommStructPrivate.origCudaSetDevice) {
         myncclCommStructPrivate.origCudaSetDevice = (cudaError_t (*)(int))dlsym(exe, "cudaSetDevice");
     }
-    // fprintf(stderr, "debug: origCudaSetDevice=%p\n", myncclCommStructPrivate.origCudaSetDevice);
+
     myncclCommStructPrivate.jmpPatchCudaSetDevice = cdl_jmp_attach((void**)&myncclCommStructPrivate.origCudaSetDevice, (void**)myncclCudaSetDevice);
 
     myncclCommStructPrivate.origNcclGetUniqueId = (void*)ncclGetUniqueId;
