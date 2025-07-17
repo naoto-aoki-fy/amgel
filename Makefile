@@ -1,17 +1,24 @@
 FRIDA_VERSION = 17.2.6
 CPUARCH = $(shell uname -m)
 KERNEL = $(shell uname -s | tr 'A-Z' 'a-z')
+FRIDA_DIR = frida
 FRIDA_POSTFIX = $(FRIDA_VERSION)-$(KERNEL)-${CPUARCH}.tar.xz
 FRIDA_CORE_TARXZ = frida-core-devkit-$(FRIDA_POSTFIX)
 FRIDA_GUM_TARXZ = frida-gum-devkit-$(FRIDA_POSTFIX)
-FRIDA_CORE_A = frida/libfrida-core.a
-FRIDA_GUM_A = frida/libfrida-gum.a
+FRIDA_CORE_A = $(FRIDA_DIR)/libfrida-core.a
+FRIDA_GUM_A = $(FRIDA_DIR)/libfrida-gum.a
+FRIDA_SO = $(FRIDA_DIR)/so
+FRIDA_CORE_SO = $(FRIDA_DIR)/so/libfrida-core.so
+FRIDA_GUM_SO = $(FRIDA_DIR)/so/libfrida-gum.so
 
 .Phony: target
-target: amgel.so
+target: amgel_dynamic.so
 
 .Phony: frida
 frida: $(FRIDA_CORE_A) $(FRIDA_GUM_A)
+
+.Phony: frida_so
+frida_so: $(FRIDA_CORE_SO) $(FRIDA_GUM_SO)
 
 $(FRIDA_CORE_A): $(FRIDA_CORE_TARXZ)
 	mkdir -p frida
@@ -27,13 +34,30 @@ $(FRIDA_CORE_TARXZ):
 	curl -LO https://github.com/frida/frida/releases/download/$(FRIDA_VERSION)/$(FRIDA_CORE_TARXZ)
 	# touch -t 197001020001.00 $(FRIDA_CORE_TARXZ)
 
+$(FRIDA_CORE_SO): $(FRIDA_CORE_A)
+	mkdir -p $(FRIDA_DIR)/libfrida-core-o
+	mkdir -p $(FRIDA_SO)
+	ar x $(FRIDA_CORE_A) --output $(FRIDA_DIR)/libfrida-core-o
+	cd $(FRIDA_DIR)/libfrida-core-o && g++ -shared -fPIC *.o .*.o -o ../../$(FRIDA_SO)/libfrida-core.so
+
 $(FRIDA_GUM_TARXZ):
 	curl -LO https://github.com/frida/frida/releases/download/$(FRIDA_VERSION)/$(FRIDA_GUM_TARXZ)
 	# touch -t 197001020001.00 $(FRIDA_GUM_TARXZ)
 
-amgel.so: amgel.cpp frida
-	nvcc -Wno-deprecated-gpu-targets -shared -Xcompiler -fPIC -std=c++11 -lmpi -lnccl -lelf -rdc=true --cudart=shared -I./frida -L./frida -I./atlc/include ./amgel.cpp -lfrida-core -o amgel.so
+$(FRIDA_GUM_SO): $(FRIDA_GUM_A)
+	mkdir -p $(FRIDA_DIR)/libfrida-gum-o
+	mkdir -p $(FRIDA_SO)
+	ar x $(FRIDA_GUM_A) --output $(FRIDA_DIR)/libfrida-gum-o
+	cd $(FRIDA_DIR)/libfrida-gum-o && g++ -shared -fPIC *.o .*.o -o ../../$(FRIDA_SO)/libfrida-gum.so
+
+amgel_static.so: amgel.cpp frida
+	nvcc -Wno-deprecated-gpu-targets -shared -Xcompiler -fPIC -std=c++11 -lmpi -lnccl -lelf -rdc=true --cudart=shared -I$(FRIDA_DIR) -L$(FRIDA_DIR) -I./atlc/include ./amgel.cpp -lfrida-core -o amgel_static.so
+	ln -sf $(CURDIR)/amgel_static.so amgel.so
+
+amgel_dynamic.so: amgel.cpp frida_so
+	nvcc -Wno-deprecated-gpu-targets -shared -Xcompiler -fPIC -std=c++11 -lmpi -lnccl -lelf -rdc=true --cudart=shared -I$(FRIDA_DIR) -L$(FRIDA_SO) -Xlinker -rpath,$(CURDIR)/$(FRIDA_SO) -I./atlc/include ./amgel.cpp -lfrida-core -o amgel_dynamic.so
+	ln -sf $(CURDIR)/amgel_dynamic.so amgel.so
 
 .Phony: clean
 clean:
-	$(RM) amgel.so
+	$(RM) amgel_dynamic.so amgel_static.so
