@@ -50,6 +50,7 @@ namespace amgel {
         std::vector<uint64_t> pointer_list;
 
         decltype(&::cudaMalloc<void>) origCudaMalloc;
+        cudaError_t (*origCudaMallocAsync)(void**, size_t, cudaStream_t);
         decltype(&::cudaSetDevice) origCudaSetDevice;
         decltype(&::ncclGetUniqueId) origNcclGetUniqueId;
         decltype(&::ncclCommInitRank) origNcclCommInitRank;
@@ -66,6 +67,14 @@ namespace amgel {
         amgel::commStructPrivate.pointer_list.push_back((uint64_t)*devPtr);
         return ret;
     }
+
+    static cudaError_t cudaMallocAsync(void **devPtr, size_t size, cudaStream_t stream) {
+        cudaError_t const ret = amgel::commStructPrivate.origCudaMalloc(devPtr, size);
+        /* We cannot use buffer allocated with cudaMalloAsync for cudaIpcGetMemHandle */
+        amgel::commStructPrivate.pointer_list.push_back((uint64_t)*devPtr);
+        return ret;
+    }
+
 
     static cudaError_t cudaSetDevice(int device) {
         cudaError_t const ret = amgel::commStructPrivate.origCudaSetDevice(0);
@@ -279,6 +288,8 @@ namespace amgel {
         cudaStreamSynchronize = &::cudaStreamSynchronize;
 
         ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)find_symbol_offset_or_dlsym("/proc/self/exe", "cudaMalloc"), (gpointer)amgel::cudaMalloc, NULL, (gpointer*)&amgel::commStructPrivate.origCudaMalloc);
+
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)find_symbol_offset_or_dlsym("/proc/self/exe", "cudaMallocAsync"), (gpointer)amgel::cudaMallocAsync, NULL, (gpointer*)&amgel::commStructPrivate.origCudaMallocAsync);
 
         ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)find_symbol_offset_or_dlsym("/proc/self/exe", "cudaSetDevice"), (gpointer)amgel::cudaSetDevice, NULL, (gpointer*)&amgel::commStructPrivate.origCudaSetDevice);
 
