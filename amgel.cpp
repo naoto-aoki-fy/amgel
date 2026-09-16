@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <vector>
 
 #include <dlfcn.h>
 #include <libelf.h>
@@ -44,6 +45,7 @@ namespace amgel {
         bool in_group;
         std::vector<sendRecvArgs_t> send_args;
         std::vector<sendRecvArgs_t> recv_args;
+        std::vector<handleOffset> send_buff_handle_list;
         std::vector<handleOffset> src_buff_handle_list;
         std::vector<void*> src_buff_list;
         std::vector<MPI_Request> mpi_request_list;
@@ -64,14 +66,18 @@ namespace amgel {
 
     static cudaError_t cudaMalloc(void **devPtr, size_t size) {
         cudaError_t const ret = amgel::commStructPrivate.origCudaMalloc(devPtr, size);
-        amgel::commStructPrivate.pointer_list.push_back((uint64_t)*devPtr);
+        if (ret == cudaSuccess) {
+            amgel::commStructPrivate.pointer_list.push_back((uint64_t)*devPtr);
+        }
         return ret;
     }
 
     static cudaError_t cudaMallocAsync(void **devPtr, size_t size, cudaStream_t stream) {
         cudaError_t const ret = amgel::commStructPrivate.origCudaMalloc(devPtr, size);
         /* We cannot use buffer allocated with cudaMalloAsync for cudaIpcGetMemHandle */
-        amgel::commStructPrivate.pointer_list.push_back((uint64_t)*devPtr);
+        if (ret == cudaSuccess) {
+            amgel::commStructPrivate.pointer_list.push_back((uint64_t)*devPtr);
+        }
         return ret;
     }
 
@@ -137,6 +143,7 @@ namespace amgel {
     static ncclResult_t groupStart() {
         amgel::commStructPrivate.send_args.clear();
         amgel::commStructPrivate.recv_args.clear();
+        amgel::commStructPrivate.send_buff_handle_list.clear();
         amgel::commStructPrivate.src_buff_handle_list.clear();
         amgel::commStructPrivate.src_buff_list.clear();
         amgel::commStructPrivate.mpi_request_list.clear();
@@ -152,9 +159,17 @@ namespace amgel {
         amgel::commStructPrivate.mpi_request_list.resize(amgel::commStructPrivate.send_args.size() + amgel::commStructPrivate.recv_args.size());
         int mpi_request_idx = 0;
 
+        /* A send must observe work previously enqueued on its own stream. */
+        for (size_t i = 0; i < amgel::commStructPrivate.send_args.size(); ++i) {
+            ATLC_CHECK_CUDA(amgel::cudaStreamSynchronize, amgel::commStructPrivate.send_args[i].stream);
+        }
+
+        /* Keep Isend payloads alive and at stable addresses through Waitall. */
+        amgel::commStructPrivate.send_buff_handle_list.resize(amgel::commStructPrivate.send_args.size());
+
         /* get memhandle and send it to peer */
         for (size_t i = 0; i < amgel::commStructPrivate.send_args.size(); ++i) {
-            handleOffset handle_offset;
+            handleOffset& handle_offset = amgel::commStructPrivate.send_buff_handle_list[i];
             void* const buffer = amgel::getClosestPointer(amgel::commStructPrivate.send_args[i].buff, &handle_offset.offset);
             ATLC_CHECK_CUDA(amgel::cudaIpcGetMemHandle, &handle_offset.handle, buffer);
             ATLC_CHECK_MPI(MPI_Isend, &handle_offset, sizeof(handleOffset), MPI_BYTE, amgel::commStructPrivate.send_args[i].peer, 0, MPI_COMM_WORLD, &amgel::commStructPrivate.mpi_request_list[mpi_request_idx]);
@@ -163,7 +178,7 @@ namespace amgel {
 
         /* recv memhandle from peer */
         amgel::commStructPrivate.src_buff_handle_list.resize(amgel::commStructPrivate.recv_args.size());
-        for (size_t i = 0; i < amgel::commStructPrivate.send_args.size(); ++i) {
+        for (size_t i = 0; i < amgel::commStructPrivate.recv_args.size(); ++i) {
             ATLC_CHECK_MPI(MPI_Irecv, &amgel::commStructPrivate.src_buff_handle_list[i], sizeof(handleOffset), MPI_BYTE, amgel::commStructPrivate.recv_args[i].peer, 0, MPI_COMM_WORLD, &amgel::commStructPrivate.mpi_request_list[mpi_request_idx]);
             mpi_request_idx++;
         }
@@ -187,12 +202,9 @@ namespace amgel {
             );
         }
 
-        /* synchronize streams */
-        ATLC_CHECK_CUDA(amgel::cudaStreamSynchronize, amgel::commStructPrivate.recv_args[0].stream);
-        for (size_t i = 1; i < amgel::commStructPrivate.send_args.size(); ++i) {
-            if (amgel::commStructPrivate.recv_args[i].stream != amgel::commStructPrivate.recv_args[i - 1].stream) {
-                ATLC_CHECK_CUDA(amgel::cudaStreamSynchronize, amgel::commStructPrivate.recv_args[i].stream);
-            }
+        /* Complete every receive before closing the corresponding IPC mappings. */
+        for (size_t i = 0; i < amgel::commStructPrivate.recv_args.size(); ++i) {
+            ATLC_CHECK_CUDA(amgel::cudaStreamSynchronize, amgel::commStructPrivate.recv_args[i].stream);
         }
 
         /* close memhandle */
@@ -213,12 +225,11 @@ namespace amgel {
         if (comm->in_group) {
             comm->send_args.push_back({sendbuff, count, datatype, peer, stream});
         } else {
-            // not yet tested
-            handleOffset handle_offset;
+            handleOffset handle_offset = {};
             void* const buffer = amgel::getClosestPointer(sendbuff, &handle_offset.offset);
-            cudaIpcMemHandle_t handle;
-            ATLC_CHECK_CUDA(amgel::cudaIpcGetMemHandle, &handle, buffer);
-            MPI_Send(&handle_offset, sizeof(handleOffset), MPI_BYTE, peer, 0, MPI_COMM_WORLD);
+            ATLC_CHECK_CUDA(amgel::cudaStreamSynchronize, stream);
+            ATLC_CHECK_CUDA(amgel::cudaIpcGetMemHandle, &handle_offset.handle, buffer);
+            ATLC_CHECK_MPI(MPI_Send, &handle_offset, sizeof(handleOffset), MPI_BYTE, peer, 0, MPI_COMM_WORLD);
         }
         return ncclSuccess;
     }
@@ -233,6 +244,7 @@ namespace amgel {
             void* sendbuff;
             ATLC_CHECK_CUDA(amgel::cudaIpcOpenMemHandle, &sendbuff, handle_offset.handle, cudaIpcMemLazyEnablePeerAccess);
             ATLC_CHECK_CUDA(amgel::cudaMemcpyAsync, recvbuff, (void*)((uint64_t)sendbuff + handle_offset.offset), count * amgel::sizeofNcclDataType(datatype), cudaMemcpyDeviceToDevice, stream);
+            ATLC_CHECK_CUDA(amgel::cudaStreamSynchronize, stream);
             ATLC_CHECK_CUDA(amgel::cudaIpcCloseMemHandle, sendbuff);
         }
         return ncclSuccess;
