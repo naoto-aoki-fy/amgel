@@ -52,9 +52,12 @@ range must belong to a live CUDA allocation tracked by AMGeL.
 ## Implementation and stream semantics
 
 Each successful `ncclCommInitRank` creates an independent virtual communicator
-with its own duplicated MPI communicator, rank, size, sequence counters, CUDA
-IPC mappings, events, and reduction scratch storage. Communicators therefore do
-not share a singleton operation state. CUDA allocation metadata records both
+containing exactly the processes which initialize it with the same
+`ncclUniqueId`. Its MPI ranks are ordered by the requested NCCL ranks, so
+subsets and reordered ranks work without involving other `MPI_COMM_WORLD`
+processes. Each communicator has its own MPI communicator, rank, size, sequence
+counters, CUDA IPC mappings, events, and reduction scratch storage. Communicators
+therefore do not share a singleton operation state. CUDA allocation metadata records both
 base and size and is removed by intercepted `cudaFree`/`cudaFreeAsync` calls.
 
 For each collective, ranks record a ready event and exchange allocation IPC
@@ -78,8 +81,11 @@ to log communicator, rank, peer, sequence, event, stream, and direction.
 
 ### Known limitations
 
-* Communicator membership must currently exactly match `MPI_COMM_WORLD`, with
-  NCCL rank equal to MPI rank; split/subset communicators are rejected.
+* Communicator discovery uses a single-host filesystem rendezvous (in
+  `/tmp/amgel-bootstrap-<uid>` by default, or `AMGEL_BOOTSTRAP_DIR`). All
+  requested ranks must initialize with the same unique ID, size, and distinct
+  NCCL ranks. Normal completion removes rendezvous files; an abnormally killed
+  job can leave stale files that may be removed manually.
 * MPI provides host-side control-plane progress, so AMGeL does not reproduce
   NCCL's nonblocking host progress, algorithms, topology, or performance.
 * IPC mappings, events, and reduction pointer arrays are retained until

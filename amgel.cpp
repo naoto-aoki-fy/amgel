@@ -11,6 +11,11 @@
 #include <algorithm>
 #include <vector>
 #include <unistd.h>
+#include <cerrno>
+#include <climits>
+#include <string>
+
+#include <sys/stat.h>
 
 #include <dlfcn.h>
 #include <libelf.h>
@@ -221,6 +226,165 @@ namespace amgel {
         return ncclSuccess;
     }
 
+    /* ncclCommInitRank has no MPI communicator argument, so membership has to
+     * be bootstrapped out of band.  AMGeL is single-host: small, atomically
+     * published files let only the participating processes rendezvous without
+     * involving non-members in an MPI_COMM_WORLD collective. */
+    struct BootstrapRecord {
+        uint64_t magic;
+        ncclUniqueId id;
+        int ndev;
+        int nccl_rank;
+        int world_rank;
+    };
+
+    static uint64_t hashId(const ncclUniqueId& id, uint64_t seed) {
+        const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&id);
+        uint64_t hash = seed;
+        for (size_t i = 0; i < sizeof(id); ++i) { hash ^= bytes[i]; hash *= UINT64_C(1099511628211); }
+        return hash;
+    }
+
+    static bool makeDirectory(const std::string& path) {
+        return mkdir(path.c_str(), 0700) == 0 || errno == EEXIST;
+    }
+
+    static bool writeAll(int fd, const void* data, size_t bytes) {
+        const char* position = static_cast<const char*>(data);
+        while (bytes) {
+            ssize_t written = write(fd, position, bytes);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) return false;
+            position += written; bytes -= (size_t)written;
+        }
+        return true;
+    }
+
+    static bool readRecord(const std::string& path, BootstrapRecord* record) {
+        int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return false;
+        char* position = reinterpret_cast<char*>(record);
+        size_t remaining = sizeof(*record);
+        while (remaining) {
+            ssize_t got = read(fd, position, remaining);
+            if (got < 0 && errno == EINTR) continue;
+            if (got <= 0) { close(fd); return false; }
+            position += got; remaining -= (size_t)got;
+        }
+        char extra;
+        bool exact = read(fd, &extra, 1) == 0;
+        close(fd);
+        return exact;
+    }
+
+    static bool publishFile(const std::string& path, const void* data, size_t bytes) {
+        static std::atomic<uint64_t> serial(0);
+        std::string temporary = path + ".tmp-" + std::to_string((long long)getpid()) + "-" +
+                                std::to_string((unsigned long long)++serial);
+        int fd = open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd < 0) return false;
+        bool ok = writeAll(fd, data, bytes) && fsync(fd) == 0;
+        close(fd);
+        if (ok) ok = link(temporary.c_str(), path.c_str()) == 0;
+        unlink(temporary.c_str());
+        return ok;
+    }
+
+    static bool sameBootstrap(const BootstrapRecord& record, const ncclUniqueId& id,
+                              int ndev, int rank) {
+        return record.magic == UINT64_C(0x414d47454c425354) && record.ndev == ndev &&
+               record.nccl_rank == rank && std::memcmp(&record.id, &id, sizeof(id)) == 0;
+    }
+
+    static ncclResult_t bootstrapComm(MPI_Comm* result, const ncclUniqueId& id, int ndev, int rank) {
+        int world_rank = -1, world_size = 0;
+        if (MPI_Comm_rank(MPI_COMM_WORLD, &world_rank) != MPI_SUCCESS ||
+            MPI_Comm_size(MPI_COMM_WORLD, &world_size) != MPI_SUCCESS || ndev > world_size)
+            return ncclInvalidArgument;
+
+        const char* configured = std::getenv("AMGEL_BOOTSTRAP_DIR");
+        std::string root = configured && *configured ? configured : "/tmp/amgel-bootstrap-" + std::to_string((long long)getuid());
+        if (!makeDirectory(root)) return ncclSystemError;
+        uint64_t h1 = hashId(id, UINT64_C(1469598103934665603));
+        uint64_t h2 = hashId(id, UINT64_C(7809847782465536322));
+        char name[64];
+        std::snprintf(name, sizeof(name), "/comm-%016llx-%016llx",
+                      (unsigned long long)h1, (unsigned long long)h2);
+        std::string directory = root + name;
+        if (!makeDirectory(directory)) return ncclSystemError;
+
+        BootstrapRecord local = {UINT64_C(0x414d47454c425354), id, ndev, rank, world_rank};
+        std::string rank_path = directory + "/rank-" + std::to_string(rank);
+        if (!publishFile(rank_path, &local, sizeof(local))) return ncclInvalidUsage;
+
+        std::vector<int> members(ndev, -1);
+        for (;;) {
+            bool complete = true;
+            for (int r = 0; r < ndev; ++r) {
+                if (members[r] >= 0) continue;
+                BootstrapRecord peer;
+                if (!readRecord(directory + "/rank-" + std::to_string(r), &peer)) { complete = false; continue; }
+                if (!sameBootstrap(peer, id, ndev, r) || peer.world_rank < 0 || peer.world_rank >= world_size)
+                    return ncclInvalidUsage;
+                members[r] = peer.world_rank;
+            }
+            if (complete) break;
+            usleep(1000);
+        }
+        std::vector<int> sorted = members;
+        std::sort(sorted.begin(), sorted.end());
+        if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) return ncclInvalidUsage;
+
+        int* tag_upper_bound = NULL, present = 0;
+        if (MPI_Comm_get_attr(MPI_COMM_WORLD, MPI_TAG_UB, &tag_upper_bound, &present) != MPI_SUCCESS ||
+            !present || tag_upper_bound == NULL || *tag_upper_bound < 0) return ncclSystemError;
+        int tag = -1;
+        std::string tag_selection = directory + "/tag";
+        if (rank == 0) {
+            uint64_t range = (uint64_t)*tag_upper_bound + 1;
+            for (uint64_t attempt = 0; attempt < range; ++attempt) {
+                int candidate = (int)((h1 + attempt) % range);
+                std::string reservation = root + "/tag-" + std::to_string(candidate);
+                int fd = open(reservation.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+                if (fd < 0) { if (errno == EEXIST) continue; return ncclSystemError; }
+                bool ok = writeAll(fd, &local, sizeof(local)); close(fd);
+                if (!ok || !publishFile(tag_selection, &candidate, sizeof(candidate))) {
+                    unlink(reservation.c_str()); return ncclSystemError;
+                }
+                tag = candidate; break;
+            }
+            if (tag < 0) return ncclSystemError;
+        } else {
+            for (;;) {
+                int fd = open(tag_selection.c_str(), O_RDONLY | O_CLOEXEC);
+                if (fd >= 0) {
+                    ssize_t got = read(fd, &tag, sizeof(tag)); close(fd);
+                    if (got == (ssize_t)sizeof(tag)) break;
+                }
+                usleep(1000);
+            }
+        }
+
+        MPI_Group world_group = MPI_GROUP_NULL, member_group = MPI_GROUP_NULL;
+        int error = MPI_Comm_group(MPI_COMM_WORLD, &world_group);
+        if (error == MPI_SUCCESS) error = MPI_Group_incl(world_group, ndev, members.data(), &member_group);
+        if (error == MPI_SUCCESS) error = MPI_Comm_create_group(MPI_COMM_WORLD, member_group, tag, result);
+        if (member_group != MPI_GROUP_NULL) MPI_Group_free(&member_group);
+        if (world_group != MPI_GROUP_NULL) MPI_Group_free(&world_group);
+        if (error != MPI_SUCCESS || *result == MPI_COMM_NULL) return ncclSystemError;
+
+        /* Ensure no later communicator can reuse this creation tag until every
+         * member has left MPI_Comm_create_group. */
+        if (MPI_Barrier(*result) != MPI_SUCCESS) { MPI_Comm_free(result); return ncclSystemError; }
+        if (rank == 0) {
+            unlink((root + "/tag-" + std::to_string(tag)).c_str());
+            unlink(tag_selection.c_str());
+            for (int r = 0; r < ndev; ++r) unlink((directory + "/rank-" + std::to_string(r)).c_str());
+            rmdir(directory.c_str());
+        }
+        return ncclSuccess;
+    }
+
     void* getAllocation(void* pointer_input, size_t bytes, uint64_t* offset) {
         std::lock_guard<std::mutex> lock(runtime.pointer_mutex);
         uintptr_t p = (uintptr_t)pointer_input;
@@ -239,16 +403,17 @@ namespace amgel {
         VirtualComm* virtual_comm = new (std::nothrow) VirtualComm;
         if (virtual_comm == NULL) return ncclSystemError;
         virtual_comm->unique_id = nccl_id;
-        if (MPI_Comm_dup(MPI_COMM_WORLD, &virtual_comm->mpi_comm) != MPI_SUCCESS) {
+        ncclResult_t bootstrap = bootstrapComm(&virtual_comm->mpi_comm, nccl_id, ndev, rank);
+        if (bootstrap != ncclSuccess) {
             delete virtual_comm;
-            return ncclSystemError;
+            return bootstrap;
         }
         virtual_comm->rank = rank;
         virtual_comm->ndev = ndev;
         int mpi_rank = -1, mpi_size = 0;
         MPI_Comm_rank(virtual_comm->mpi_comm, &mpi_rank);
         MPI_Comm_size(virtual_comm->mpi_comm, &mpi_size);
-        if (mpi_rank != rank || mpi_size != ndev) { MPI_Comm_free(&virtual_comm->mpi_comm); delete virtual_comm; return ncclInvalidArgument; }
+        if (mpi_rank != rank || mpi_size != ndev) { MPI_Comm_free(&virtual_comm->mpi_comm); delete virtual_comm; return ncclSystemError; }
         virtual_comm->next_send_sequence.assign(ndev, 0);
         virtual_comm->next_recv_sequence.assign(ndev, 0);
         {
