@@ -1,3 +1,13 @@
+-include config.mk
+
+CFLAGS_VENDOR ?=
+LDFLAGS_VENDOR ?=
+GENCODE_FLAGS ?=
+NVCC ?= nvcc --forward-unknown-to-host-compiler
+NVCC_CFLAGS = $(CFLAGS_VENDOR) -Wno-deprecated-gpu-targets -Xcompiler -fPIC -std=c++11 -rdc=true $(GENCODE_FLAGS)
+NVCC_LDFLAGS = $(LDFLAGS_VENDOR) --cudart=shared
+LDLIBS ?= -lmpi -lnccl -lelf
+
 FRIDA_VERSION = 17.2.6
 CPUARCH = $(shell uname -m)
 KERNEL = $(shell uname -s | tr 'A-Z' 'a-z')
@@ -48,11 +58,11 @@ $(FRIDA_GUM_SO): $(FRIDA_GUM_A)
 	cd $(FRIDA_DIR)/libfrida-gum-o && g++ -shared -fPIC *.o .*.o -o ../../$(FRIDA_SO)/libfrida-gum.so
 
 amgel_static.so: amgel.cpp $(FRIDA_CORE_A) $(FRIDA_GUM_A)
-	nvcc -Wno-deprecated-gpu-targets -shared -Xcompiler -fPIC -std=c++11 -lmpi -lnccl -lelf -rdc=true --cudart=shared -I$(FRIDA_DIR) -L$(FRIDA_DIR) -I./atlc/include ./amgel.cpp -lfrida-core -o amgel_static.so
+	$(NVCC) $(NVCC_CFLAGS) -shared -I$(FRIDA_DIR) ./amgel.cpp $(NVCC_LDFLAGS) -L$(FRIDA_DIR) -lfrida-core $(LDLIBS) -o amgel_static.so
 	ln -sf $(CURDIR)/amgel_static.so amgel.so
 
 amgel_dynamic.so: amgel.cpp $(FRIDA_CORE_SO) $(FRIDA_GUM_SO)
-	nvcc -Wno-deprecated-gpu-targets -shared -Xcompiler -fPIC -std=c++11 -lmpi -lnccl -lelf -rdc=true --cudart=shared -I$(FRIDA_DIR) -L$(FRIDA_SO) -Xlinker -rpath,$(CURDIR)/$(FRIDA_SO) -I./atlc/include ./amgel.cpp -lfrida-core -o amgel_dynamic.so
+	$(NVCC) $(NVCC_CFLAGS) -shared -I$(FRIDA_DIR) ./amgel.cpp $(NVCC_LDFLAGS) -L$(FRIDA_SO) -Xlinker -rpath,$(CURDIR)/$(FRIDA_SO) -lfrida-core $(LDLIBS) -o amgel_dynamic.so
 	ln -sf $(CURDIR)/amgel_dynamic.so amgel.so
 
 .PHONY: clean

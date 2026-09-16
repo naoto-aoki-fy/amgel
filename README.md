@@ -6,13 +6,27 @@ a performance model for a multi-GPU system.
 
 ## Build
 
-CUDA, MPI, NCCL, libelf, and `nvcc` are required. The first build downloads the
-configured Frida development kit.
+CUDA, MPI, NCCL, libelf, and `nvcc` are required. Prepare
+[`atlc`](https://github.com/naoto-aoki-fy/atlc) separately; it is not included
+as a submodule.
+
+Define the environment-specific compiler, linker, and GPU architecture options
+in `config.mk`, which the Makefile automatically includes. For example:
+
+```make
+CFLAGS_VENDOR = -I/path/to/mpi/include -I/path/to/nccl/include -I/path/to/libelf/include -I/path/to/atlc/include
+LDFLAGS_VENDOR = -L/path/to/mpi/lib -L/path/to/nccl/lib -L/path/to/libelf/lib
+GENCODE_FLAGS = -gencode=arch=compute_xx,code=sm_xx
+```
+
+The `atlc/include` path may instead be supplied through `CPATH`. Once the
+required include and library paths are configured, build AMGeL with:
 
 ```sh
-git submodule update --init
 make
 ```
+
+The first build downloads and extracts the configured Frida development kits.
 
 Run an MPI/NCCL application with the interposer preloaded, for example:
 
