@@ -22,8 +22,14 @@ not synchronize a CUDA stream or wait for the copy to finish.  Set
 `AMGEL_DEBUG_P2P=1` to log communicator, rank, peer, sequence, event, stream, and
 direction information.
 
+Each successful `ncclCommInitRank()` owns an independent virtual communicator,
+including its duplicated MPI communicator, P2P sequence numbers, CUDA IPC
+mappings, and events. `ncclGroupStart()` queues operations in thread-local group
+state and keeps queues for different communicators separate. Communicators must
+be released with `ncclCommDestroy()`.
+
 This remains an emulation rather than native NCCL: transfers are CUDA IPC
 copies initiated on the receiver, MPI metadata exchange may block the host
 until matching calls arrive, IPC resources are retained for the communicator's
-lifetime, and the current implementation represents one emulated communicator
-per process.
+lifetime, and communicator membership/subsets still follow the existing
+`MPI_COMM_WORLD` duplication model.
