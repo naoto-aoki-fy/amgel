@@ -316,3 +316,7 @@ Set `NCCL_FOLD_RESOURCE_STATS=1` to print per-communicator teardown accounting
 for owned event creation/pool peak, imported event opens/cache size, IPC memory
 mappings, reduction-scratch high-water mark, and retained IPC-exported grouped
 send snapshots. Normal execution does not print these statistics.
+
+## Acknowledgments
+
+This repository is based on results obtained from a project, JPNP20017, commissioned by the New Energy and Industrial Technology Development Organization (NEDO).
