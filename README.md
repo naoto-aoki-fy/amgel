@@ -94,9 +94,8 @@ executions:
   per-communicator sequence. All ranks must enter them in the same order and
   agree on kind, root, datatype, reduction operator, and byte count; disagreement
   returns an error rather than intentionally selecting one rank's metadata.
-  P2P ordering is the per-peer sequence ordering described above. Ordering of
-  mixed operations inside groups is limited as described under known
-  deviations.
+  P2P ordering is the per-peer sequence ordering described above. Grouped calls
+  retain their issuing order across operation types and communicators.
 * **CUDA stream ordering and inter-rank happens-before edges.** A ready event is
   recorded in the operation's stream before a remote read. The consuming stream
   waits for that event before its copy or reduction. A completion event and
@@ -147,7 +146,7 @@ NCCL Fold does **not** preserve the following:
   and `ncclReduceScatter`, with the datatypes and operators in the table above.
   The interposed management/query surface is `ncclGetUniqueId`,
   `ncclCommInitRank`, `ncclCommCount`, `ncclCommUserRank`, `ncclCommDestroy`, and
-  non-nested `ncclGroupStart`/`ncclGroupEnd`. No equivalence claim is made for
+  nested `ncclGroupStart`/`ncclGroupEnd`. No equivalence claim is made for
   other NCCL entry points, including communicator split/abort/finalize,
   asynchronous error queries, registered buffers, user-defined reduction
   operators, or NCCL device APIs.
@@ -158,8 +157,8 @@ NCCL Fold does **not** preserve the following:
 * Ranks issue compatible operations. Collectives occur in the same order on all
   communicator ranks; Send and Recv are balanced and ordered compatibly for each
   peer. Concurrent host threads must not race operations on the same communicator
-  (the collective sequence is not thread-safe), and a thread may have at most one
-  active, non-nested group.
+  (the collective sequence is not thread-safe). Groups are thread-local and may
+  be nested; only the outermost `ncclGroupEnd` submits their accumulated work.
 * Streams, allocations, and communicators remain valid until all queued work that
   refers to them has completed. Applications use CUDA stream/event
   synchronization rather than NCCL API return as evidence of GPU completion.
@@ -179,12 +178,10 @@ NCCL Fold does **not** preserve the following:
   later operation even while CUDA still considers earlier stream-ordered uses
   valid.
 * **Grouping is only a subset of NCCL grouping semantics.** Groups are
-  thread-local and cannot nest. Calls are deferred until `ncclGroupEnd`, then
-  processed per communicator with all queued P2P operations before queued
-  collectives; interleaving between P2P and collectives, between communicators,
-  and exact call-order/atomic-launch behavior is not preserved. A group error
-  can occur after some work has already been enqueued. These differences can
-  introduce deadlocks or errors, or hide ordering bugs, relative to native NCCL.
+  thread-local, may nest, and defer submission until the outermost
+  `ncclGroupEnd`. Submission preserves call order across P2P, collectives, and
+  communicators. A group error can still occur after some work has already been
+  enqueued, and NCCL Fold does not reproduce native atomic-launch behavior.
 * **Host blocking differs.** Ungrouped operations perform blocking MPI metadata
   exchanges in the NCCL call, and grouped operations do so in `ncclGroupEnd`.
   This may introduce host deadlocks in code that depends on native nonblocking
@@ -244,8 +241,12 @@ There is one important difference from native NCCL asynchronous behavior: the
 MPI metadata exchanges block the calling host thread until every communicator
 rank enters the same collective. `ncclGroupEnd` performs this exchange for
 queued grouped operations. GPU completion remains asynchronous after the API
-returns. Groups may include existing P2P operations, and queues remain separated
-by communicator.
+returns. Before submitting a group's CUDA work in original call order, NCCL
+Fold batches the MPI P2P metadata rendezvous across the whole group. This keeps
+mutually dependent Send/Recv control-plane exchanges from blocking ordered
+submission. Grouped sends take a stream-ordered device snapshot at their call
+position, so their completion waits can be appended after the ordered group
+without permitting premature reuse of the user's source buffer.
 
 P2P uses the same ready/copy/done dependency scheme. Set `NCCL_FOLD_DEBUG_P2P=1`
 to log communicator, rank, peer, sequence, event, stream, and direction.

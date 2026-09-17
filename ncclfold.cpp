@@ -137,15 +137,16 @@ namespace nccl_fold {
 
     static RuntimeState runtime;
 
-    struct GroupEntry {
+    enum GroupOpKind { GroupSend, GroupRecv, GroupCollective };
+    struct GroupOp {
+        GroupOpKind kind;
         VirtualComm* comm;
-        std::vector<sendRecvArgs_t> send_args;
-        std::vector<sendRecvArgs_t> recv_args;
-        std::vector<CollectiveArgs> collective_args;
+        sendRecvArgs_t p2p;
+        CollectiveArgs collective;
     };
     struct GroupState {
-        bool active = false;
-        std::vector<GroupEntry> entries;
+        unsigned int depth = 0;
+        std::vector<GroupOp> operations;
     };
     static thread_local GroupState group_state;
 
@@ -425,9 +426,8 @@ namespace nccl_fold {
     }
 
     static ncclResult_t groupStart() {
-        if (group_state.active) return ncclInvalidUsage;
-        group_state.entries.clear();
-        group_state.active = true;
+        if (group_state.depth == 0) group_state.operations.clear();
+        ++group_state.depth;
         return ncclSuccess;
     }
 
@@ -577,13 +577,92 @@ namespace nccl_fold {
         return deferred_error;
     }
 
-    static GroupEntry* groupEntry(VirtualComm* comm) {
-        for (size_t i = 0; i < group_state.entries.size(); ++i) {
-            if (group_state.entries[i].comm == comm) return &group_state.entries[i];
+    /* Grouped P2P metadata is exchanged as one control-plane batch before any
+     * grouped operation is enqueued. Event records and data movement stay in
+     * GroupOp order; send completion waits are safely deferred via snapshots. */
+    struct PreparedGroupP2P {
+        readyMessage ready;
+        doneMessage done;
+        cudaEvent_t local_event;
+        void* send_snapshot;
+        PreparedGroupP2P() : local_event(NULL), send_snapshot(NULL) { std::memset(&ready, 0, sizeof(ready)); std::memset(&done, 0, sizeof(done)); }
+    };
+
+    static ncclResult_t prepareGroupedP2P(std::vector<GroupOp> const& operations, std::vector<PreparedGroupP2P>& prepared) {
+        prepared.resize(operations.size());
+        std::vector<MPI_Request> requests;
+        requests.reserve(operations.size() * 2);
+        for (size_t i = 0; i < operations.size(); ++i) {
+            GroupOp const& grouped = operations[i];
+            if (grouped.kind == GroupCollective) continue;
+            sendRecvArgs_t const& op = grouped.p2p;
+            PreparedGroupP2P& p = prepared[i];
+            uint64_t const type_size = sizeofNcclDataType(op.datatype);
+            if (type_size == 0 || op.count > UINT64_MAX / type_size) return ncclInvalidArgument;
+            uint64_t const bytes = op.count * type_size;
+            MPI_Request request = MPI_REQUEST_NULL;
+            ncclResult_t result;
+            if (grouped.kind == GroupSend) {
+                if (getAllocation(op.buff, bytes, NULL) == NULL) return ncclInvalidArgument;
+                if (bytes) {
+                    if ((result = cudaCheck(runtime.origCudaMalloc(&p.send_snapshot, bytes), "cudaMalloc(group send snapshot)")) != ncclSuccess) return result;
+                    grouped.comm->scratch_allocations.push_back(p.send_snapshot);
+                    if ((result = cudaCheck(runtime.cudaIpcGetMemHandle(&p.ready.memory.handle, p.send_snapshot), "cudaIpcGetMemHandle(group send snapshot)")) != ncclSuccess) return result;
+                }
+                if ((result = cudaCheck(runtime.cudaEventCreateWithFlags(&p.local_event, cudaEventInterprocess | cudaEventDisableTiming), "cudaEventCreateWithFlags(group send ready)")) != ncclSuccess) return result;
+                grouped.comm->owned_events.push_back(p.local_event);
+                if ((result = cudaCheck(runtime.cudaIpcGetEventHandle(&p.ready.ready, p.local_event), "cudaIpcGetEventHandle(group send ready)")) != ncclSuccess) return result;
+                p.ready.bytes = bytes; p.ready.sequence = op.sequence;
+                if ((result = mpiCheck(MPI_Isend(&p.ready, sizeof(p.ready), MPI_BYTE, op.peer, readyTag, grouped.comm->mpi_comm, &request), "MPI_Isend(group ready)")) != ncclSuccess) return result;
+                requests.push_back(request);
+                if ((result = mpiCheck(MPI_Irecv(&p.done, sizeof(p.done), MPI_BYTE, op.peer, doneTag, grouped.comm->mpi_comm, &request), "MPI_Irecv(group done)")) != ncclSuccess) return result;
+                requests.push_back(request);
+            } else {
+                if (bytes && getAllocation(op.buff, bytes, NULL) == NULL) return ncclInvalidArgument;
+                if ((result = cudaCheck(runtime.cudaEventCreateWithFlags(&p.local_event, cudaEventInterprocess | cudaEventDisableTiming), "cudaEventCreateWithFlags(group recv done)")) != ncclSuccess) return result;
+                grouped.comm->owned_events.push_back(p.local_event);
+                if ((result = cudaCheck(runtime.cudaIpcGetEventHandle(&p.done.done, p.local_event), "cudaIpcGetEventHandle(group recv done)")) != ncclSuccess) return result;
+                p.done.sequence = op.sequence;
+                if ((result = mpiCheck(MPI_Irecv(&p.ready, sizeof(p.ready), MPI_BYTE, op.peer, readyTag, grouped.comm->mpi_comm, &request), "MPI_Irecv(group ready)")) != ncclSuccess) return result;
+                requests.push_back(request);
+                if ((result = mpiCheck(MPI_Isend(&p.done, sizeof(p.done), MPI_BYTE, op.peer, doneTag, grouped.comm->mpi_comm, &request), "MPI_Isend(group done)")) != ncclSuccess) return result;
+                requests.push_back(request);
+            }
         }
-        group_state.entries.push_back(GroupEntry());
-        group_state.entries.back().comm = comm;
-        return &group_state.entries.back();
+        if (requests.empty()) return ncclSuccess;
+        return mpiCheck(MPI_Waitall((int)requests.size(), requests.data(), MPI_STATUSES_IGNORE), "MPI_Waitall(group P2P metadata)");
+    }
+
+    static ncclResult_t enqueuePreparedGroupP2P(GroupOp const& grouped, PreparedGroupP2P const& p) {
+        sendRecvArgs_t const& op = grouped.p2p;
+        ncclResult_t result;
+        if (grouped.kind == GroupSend) {
+            if (p.done.sequence != op.sequence) return ncclInvalidArgument;
+            uint64_t const bytes = op.count * sizeofNcclDataType(op.datatype);
+            if (bytes && (result = cudaCheck(runtime.cudaMemcpyAsync(p.send_snapshot, op.buff, bytes, cudaMemcpyDeviceToDevice, op.stream), "cudaMemcpyAsync(group send snapshot)")) != ncclSuccess) return result;
+            if ((result = cudaCheck(runtime.cudaEventRecord(p.local_event, op.stream), "cudaEventRecord(group send ready)")) != ncclSuccess) return result;
+            return ncclSuccess;
+        }
+        uint64_t const type_size = sizeofNcclDataType(op.datatype);
+        uint64_t const bytes = op.count * type_size;
+        if (p.ready.sequence != op.sequence || p.ready.bytes != bytes) return ncclInvalidArgument;
+        cudaEvent_t ready = NULL;
+        void* source = NULL;
+        if ((result = cudaCheck(runtime.cudaIpcOpenEventHandle(&ready, p.ready.ready), "cudaIpcOpenEventHandle(group ready)")) != ncclSuccess) return result;
+        grouped.comm->imported_events.push_back(ready);
+        if (bytes && (result = openMemory(grouped.comm, p.ready.memory.handle, &source)) != ncclSuccess) return result;
+        if ((result = cudaCheck(runtime.cudaStreamWaitEvent(op.stream, ready, 0), "cudaStreamWaitEvent(group ready)")) != ncclSuccess) return result;
+        if (bytes && (result = cudaCheck(runtime.cudaMemcpyAsync(op.buff, (char*)source + p.ready.memory.offset, bytes, cudaMemcpyDeviceToDevice, op.stream), "cudaMemcpyAsync(group P2P)")) != ncclSuccess) return result;
+        return cudaCheck(runtime.cudaEventRecord(p.local_event, op.stream), "cudaEventRecord(group recv done)");
+    }
+
+    static ncclResult_t enqueuePreparedGroupSendCompletion(GroupOp const& grouped, PreparedGroupP2P const& p) {
+        if (grouped.kind != GroupSend) return ncclSuccess;
+        cudaEvent_t done = NULL;
+        ncclResult_t result = cudaCheck(runtime.cudaIpcOpenEventHandle(&done, p.done.done), "cudaIpcOpenEventHandle(group done)");
+        if (result != ncclSuccess) return result;
+        grouped.comm->imported_events.push_back(done);
+        return cudaCheck(runtime.cudaStreamWaitEvent(grouped.p2p.stream, done, 0), "cudaStreamWaitEvent(group done)");
     }
 
     struct CollectiveDescriptor {
@@ -737,25 +816,34 @@ namespace nccl_fold {
     }
 
     static ncclResult_t groupEnd() {
-        if (!group_state.active) return ncclInvalidUsage;
-        ncclResult_t result = ncclSuccess;
-        for (size_t i = 0; i < group_state.entries.size(); ++i) {
-            GroupEntry& entry = group_state.entries[i];
-            if (getVirtualComm(reinterpret_cast<ncclComm_t>(entry.comm)) == NULL) {
-                if (result == ncclSuccess) result = ncclInvalidArgument;
-                continue;
-            }
-            ncclResult_t current = enqueueP2P(entry.comm, entry.send_args, entry.recv_args);
-            if (result == ncclSuccess && current != ncclSuccess) result = current;
-            for (size_t j = 0; j < entry.collective_args.size(); ++j) {
-                current = enqueueCollective(entry.comm, entry.collective_args[j]);
-                if (result == ncclSuccess && current != ncclSuccess) result = current;
-                if (current != ncclSuccess) break;
-            }
+        if (group_state.depth == 0) return ncclInvalidUsage;
+        if (--group_state.depth != 0) return ncclSuccess;
+
+        /* Detach first so every error path leaves this thread's group reusable. */
+        std::vector<GroupOp> operations;
+        operations.swap(group_state.operations);
+        for (size_t i = 0; i < operations.size(); ++i)
+            if (getVirtualComm(reinterpret_cast<ncclComm_t>(operations[i].comm)) == NULL)
+                return ncclInvalidArgument;
+
+        std::vector<PreparedGroupP2P> prepared;
+        ncclResult_t result = prepareGroupedP2P(operations, prepared);
+        if (result != ncclSuccess) return result;
+        for (size_t i = 0; i < operations.size(); ++i) {
+            GroupOp const& op = operations[i];
+            result = op.kind == GroupCollective
+                ? enqueueCollective(op.comm, op.collective)
+                : enqueuePreparedGroupP2P(op, prepared[i]);
+            if (result != ncclSuccess) return result;
         }
-        group_state.entries.clear();
-        group_state.active = false;
-        return result;
+        /* Snapshots make grouped sends consume their user buffers at the send's
+         * exact stream position.  Completion waits can therefore be appended
+         * after all group work, avoiding Send/collective/Recv dependency cycles. */
+        for (size_t i = 0; i < operations.size(); ++i) {
+            result = enqueuePreparedGroupSendCompletion(operations[i], prepared[i]);
+            if (result != ncclSuccess) return result;
+        }
+        return ncclSuccess;
     }
 
     static ncclResult_t collective(CollectiveKind kind, const void* sendbuff, void* recvbuff,
@@ -764,7 +852,12 @@ namespace nccl_fold {
         VirtualComm* comm = getVirtualComm(handle);
         if (!comm) return ncclInvalidArgument;
         CollectiveArgs args = {kind, sendbuff, recvbuff, count, datatype, op, root, stream};
-        if (group_state.active) { groupEntry(comm)->collective_args.push_back(args); return ncclSuccess; }
+        if (group_state.depth != 0) {
+            GroupOp grouped = {};
+            grouped.kind = GroupCollective; grouped.comm = comm; grouped.collective = args;
+            group_state.operations.push_back(grouped);
+            return ncclSuccess;
+        }
         return enqueueCollective(comm, args);
     }
 
@@ -804,8 +897,10 @@ namespace nccl_fold {
             sequence = comm->next_send_sequence[peer]++;
         }
         sendRecvArgs_t op = {const_cast<void*>(sendbuff), (uint64_t)count, (int)datatype, peer, stream, sequence};
-        if (group_state.active) {
-            groupEntry(comm)->send_args.push_back(op);
+        if (group_state.depth != 0) {
+            GroupOp grouped = {};
+            grouped.kind = GroupSend; grouped.comm = comm; grouped.p2p = op;
+            group_state.operations.push_back(grouped);
             return ncclSuccess;
         }
         std::vector<sendRecvArgs_t> sends(1, op), recvs;
@@ -823,8 +918,10 @@ namespace nccl_fold {
             sequence = comm->next_recv_sequence[peer]++;
         }
         sendRecvArgs_t op = {recvbuff, (uint64_t)count, (int)datatype, peer, stream, sequence};
-        if (group_state.active) {
-            groupEntry(comm)->recv_args.push_back(op);
+        if (group_state.depth != 0) {
+            GroupOp grouped = {};
+            grouped.kind = GroupRecv; grouped.comm = comm; grouped.p2p = op;
+            group_state.operations.push_back(grouped);
             return ncclSuccess;
         }
         std::vector<sendRecvArgs_t> sends, recvs(1, op);
