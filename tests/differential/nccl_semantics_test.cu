@@ -5,17 +5,15 @@
 #include <cuda_bf16.h>
 #include <atlc/check_cuda.hpp>
 #include <atlc/check_nccl.hpp>
+#include <cstdio>
 #include <exception>
 #include <algorithm>
-#include <fstream>
-#include <iomanip>
-#include <sstream>
 #include <string>
 #include <vector>
 #include <sys/stat.h>
 
 static int rank_, nranks_;
-static std::ofstream out;
+static FILE *out;
 static std::string mode_, filter_;
 static void die(const char *s)
 {
@@ -102,15 +100,30 @@ static void record(const std::string &id, const char *op, ncclDataType_t dt, con
 {
     if (!selected(id))
         return;
-    out << "{\"case_id\":\"" << id << "\",\"operation\":\"" << op << "\",\"ranks\":" << nranks_ << ",\"rank\":" << rank_ << ",\"datatype\":\"" << dtname(dt) << "\",\"reduction\":" << (red ? (std::string("\"") + red + "\"") : "null") << ",\"root\":" << (root < 0 ? "null" : std::to_string(root)) << ",\"peer\":" << (peer < 0 ? "null" : std::to_string(peer)) << ",\"count\":" << count << ",\"in_place\":" << (in_place ? "true" : "false") << ",\"stream\":\"" << stream << "\",\"checks\":\"" << checks << "\",\"state\":\"" << state << "\",\"mode\":\"" << mode_ << "\",\"values\":[";
+    fprintf(out, "{\"case_id\":\"%s\",\"operation\":\"%s\",\"ranks\":%d,\"rank\":%d,\"datatype\":\"%s\",\"reduction\":", id.c_str(), op, nranks_, rank_, dtname(dt));
+    if (red)
+        fprintf(out, "\"%s\"", red);
+    else
+        fputs("null", out);
+    fputs(",\"root\":", out);
+    if (root < 0)
+        fputs("null", out);
+    else
+        fprintf(out, "%d", root);
+    fputs(",\"peer\":", out);
+    if (peer < 0)
+        fputs("null", out);
+    else
+        fprintf(out, "%d", peer);
+    fprintf(out, ",\"count\":%d,\"in_place\":%s,\"stream\":\"%s\",\"checks\":\"%s\",\"state\":\"%s\",\"mode\":\"%s\",\"values\":[", count, in_place ? "true" : "false", stream, checks, state, mode_.c_str());
     for (size_t i = 0; i < v.size(); i++)
     {
         if (i)
-            out << ',';
-        out << std::setprecision(17) << dv(v[i]);
+            fputc(',', out);
+        fprintf(out, "%.17g", dv(v[i]));
     }
-    out << "]}\n";
-    out.flush();
+    fputs("]}\n", out);
+    fflush(out);
 }
 template <class T>
 static void basic_case(ncclComm_t comm, ncclDataType_t dt, const std::string &fam, int count, bool ip, int root, ncclRedOp_t rop)
@@ -453,7 +466,8 @@ int main(int argc, char **argv)
         MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD);
         ncclComm_t comm;
         ATLC_CHECK_NCCL(ncclCommInitRank, &comm, nranks_, id, rank_);
-        out.open(dir + "/rank-" + std::to_string(rank_) + ".jsonl");
+        std::string output_path = dir + "/rank-" + std::to_string(rank_) + ".jsonl";
+        out = fopen(output_path.c_str(), "w");
         if (!out)
             die("cannot open result file");
 #if NCCL_VERSION_CODE < NCCL_VERSION(2, 28, 0)
@@ -480,7 +494,7 @@ int main(int argc, char **argv)
             matrix(comm, family);
         ATLC_CHECK_CUDA(cudaDeviceSynchronize);
         ATLC_CHECK_NCCL(ncclCommDestroy, comm);
-        out.close();
+        fclose(out);
         MPI_Finalize();
         return 0;
     }
