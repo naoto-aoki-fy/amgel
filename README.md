@@ -44,6 +44,16 @@ An ordinary call such as
 `ncclAllReduce(send, receive, count, ncclFloat32, ncclSum, comm, stream)` is
 then executed across four logical ranks on physical device zero.
 
+## Differential correctness tests
+
+`tests/differential` contains a native-NCCL oracle suite for the supported
+semantic contract.  It runs identical deterministic workloads natively on 2,
+4, or 8 GPUs and through NCCL Fold on one GPU, records JSON Lines artifacts,
+and performs datatype-aware comparisons.  See
+[`tests/differential/README.md`](tests/differential/README.md) for prerequisites,
+coverage, commands, skip rules, and diagnostics.  Build it with `make
+differential` and run both sides with `make differential-run`.
+
 ### Diagnostic timeout
 
 Set `NCCL_FOLD_TIMEOUT_MS` to a positive integer to bound each NCCL Fold

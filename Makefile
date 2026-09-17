@@ -21,8 +21,19 @@ FRIDA_SO = $(FRIDA_DIR)/so
 FRIDA_CORE_SO = $(FRIDA_DIR)/so/libfrida-core.so
 FRIDA_GUM_SO = $(FRIDA_DIR)/so/libfrida-gum.so
 
-.PHONY: target
+.PHONY: target differential differential-run
 target: ncclfold.so
+
+DIFFERENTIAL_BIN ?= tests/differential/nccl_semantics_test
+
+differential: $(DIFFERENTIAL_BIN)
+
+$(DIFFERENTIAL_BIN): tests/differential/nccl_semantics_test.cu
+	$(NVCC) $(CFLAGS_VENDOR) -std=c++14 -Wno-deprecated-gpu-targets $(GENCODE_FLAGS) $< \
+		$(LDFLAGS_VENDOR) --cudart=shared -lmpi -lnccl -o $@
+
+differential-run: differential ncclfold.so
+	python3 tests/differential/run_differential.py --ncclfold ./ncclfold.so
 
 ncclfold.so: ncclfold_dynamic.so
 	ln -sf $(CURDIR)/$< ncclfold.so
@@ -67,4 +78,4 @@ ncclfold_dynamic.so: ncclfold.cpp $(FRIDA_CORE_SO) $(FRIDA_GUM_SO)
 
 .PHONY: clean
 clean:
-	$(RM) ncclfold.so ncclfold_dynamic.so ncclfold_static.so
+	$(RM) ncclfold.so ncclfold_dynamic.so ncclfold_static.so $(DIFFERENTIAL_BIN)
