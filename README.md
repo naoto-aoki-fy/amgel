@@ -78,11 +78,11 @@ range must belong to a live CUDA allocation tracked by NCCL Fold.
 
 ## Semantic Contract
 
-NCCL Fold is intended as a correctness-oriented execution environment for the
-supported API subset below. Equivalence means equality of the communicated
-values and the relevant CUDA-stream dependencies for a **supported execution**;
-it does not mean that NCCL Fold is a complete NCCL implementation or that it
-reproduces how a native multi-GPU run makes progress.
+NCCL Fold is a correctness-oriented execution environment for the supported API
+subset below. For a **supported execution**, equivalence means equality of the
+communicated values and preservation of the CUDA-stream dependencies needed to
+consume and reuse those values. It does not include implementation strategy,
+host-side progress, performance, or failure behavior.
 
 NCCL Fold preserves the following observable properties for supported
 executions:
@@ -98,9 +98,9 @@ executions:
   operators in the compatibility table. Gather places rank `i` in root output
   slot `i`; Scatter sends root input slot `i` to rank `i`; and rank `r`'s
   AlltoAll output slot `i` receives source rank `i`'s slot `r`. Reductions are
-  evaluated in increasing logical-rank order. This is mathematical/value
-  equivalence, subject to the floating-point caveat below, not byte-for-byte
-  equivalence with an arbitrary native NCCL algorithm.
+  evaluated in increasing logical-rank order. This is value-level equivalence,
+  subject to the floating-point limitation below, not bitwise equivalence with
+  a native NCCL reduction.
 * **P2P value and matching semantics.** Send/Recv transfers the requested byte
   range. Operations are matched by communicator, peer, direction, and a
   monotonically increasing per-peer sequence number. The two sides must issue
@@ -118,8 +118,8 @@ executions:
   reciprocal stream wait keep subsequent work in each source stream behind
   remote consumption. The copy/kernel itself is enqueued in the stream supplied
   to the NCCL call. Thus ordinary work ordered before and after a supported call
-  in that stream observes the intended buffer dependencies; this claim does not
-  extend to every CUDA event API or to graph capture.
+  in that stream observes the intended buffer dependencies. This guarantee does
+  not extend to CUDA Graph capture or arbitrary CUDA event/resource interactions.
 * **Buffer reuse timing on the device.** After the returned operation in the
   source stream has completed, all remote uses that NCCL Fold enqueued for that
   operation have completed. Destination data is available to later work in its
@@ -134,26 +134,10 @@ executions:
   per virtual communicator. Correctly constructed communicators therefore do
   not intentionally match one another's operations.
 
-NCCL Fold does **not** preserve the following:
-
-* execution time, latency, bandwidth, throughput, or any other performance
-  characteristic;
-* NCCL algorithm/protocol selection, chunking, channel behavior, launch shape,
-  or reduction tree/order;
-* physical topology or transport behavior, including NVLink, PCIe, NIC, GPUDirect,
-  peer-access, NUMA, and failure characteristics;
-* physical multi-GPU concurrency, scheduling, contention, memory capacity, or
-  GPU-to-GPU isolation: every logical rank uses physical CUDA device zero;
-* native NCCL communication progress, deadlock timing, or host-side nonblocking
-  behavior and API return timing: MPI metadata rendezvous can block the calling
-  host thread until matching ranks enter an operation (or `ncclGroupEnd`); or
-* native NCCL diagnostics, error timing/recovery, asynchronous-error behavior,
-  environment-variable tuning, or behavior of APIs not explicitly interposed.
-
 ### Assumptions / Scope
 
-* There is one MPI process per logical NCCL rank, MPI is initialized, all
-  participating processes are on one host, and all logical ranks are mapped to
+* There is one MPI process per logical NCCL rank, MPI is already initialized,
+  all participating processes are on one host, and all logical ranks execute on
   physical CUDA device zero. A communicator's ranks use the same unique ID and
   size exactly once, use distinct valid logical ranks, and collectively complete
   initialization.
@@ -184,67 +168,92 @@ NCCL Fold does **not** preserve the following:
 * Streams, allocations, and communicators remain valid until all queued work that
   refers to them has completed. Applications use CUDA stream/event
   synchronization rather than NCCL API return as evidence of GPU completion.
-* The contract applies to successful calls. Process failure, malformed or stale
-  bootstrap state, MPI/CUDA failures, cancellation, and recovery after a partial
-  error are outside its scope.
+* The contract applies only to successful calls. Process failure, malformed or
+  stale bootstrap state, MPI/CUDA failures, cancellation, timeouts, and recovery
+  after a partial error are outside its scope.
 
-### Known Semantic Deviations
+### Known Semantic Deviations / Limitations
 
-* **Allocator coverage is limited.** Interposed `cudaMallocAsync` is genuinely
-  stream ordered: it calls `cudaMallocFromPoolAsync` on an NCCL Fold-owned,
-  IPC-capable explicit pool. It no longer substitutes synchronous `cudaMalloc`.
-  This resolves that synchronization deviation, but does not provide complete
-  CUDA allocator equivalence: custom/user pools, direct
-  `cudaMallocFromPoolAsync`, pool attributes, and graph capture are unsupported.
-  Devices must report memory-pool support and POSIX-FD handle support; otherwise
-  `cudaMallocAsync` returns an error with no synchronous fallback. NCCL Fold
-  removes tracking metadata when CUDA accepts `cudaFree`/`cudaFreeAsync`, so a
-  subsequently submitted communication call cannot refer to that pointer.
+* **CUDA Graph capture is unsupported.** NCCL calls made during stream capture
+  are outside the fidelity contract. Submission performs host-side MPI
+  rendezvous and CUDA IPC handle exchange/opening, leases and may create CUDA
+  events, and may allocate host or device resources. NCCL Fold has no
+  capture-safe submission path and does not record or reproduce the control
+  plane, resource setup, or rank coordination when a graph is replayed. A call
+  under capture may fail or otherwise differ; no particular failure mode is
+  guaranteed.
+* **Stream-ordered allocation is only partially preserved.** Interposed
+  `cudaMallocAsync` enqueues `cudaMallocFromPoolAsync` in the requested stream,
+  but always uses a process-global NCCL Fold-owned IPC-exportable pool rather
+  than the device's current/default or user-selected pool. Consequently pool
+  attributes, release thresholds, reuse policy, accounting, trimming, and
+  memory-pressure behavior can differ, and direct/custom-pool allocations are
+  not tracked for communication. If pool or POSIX-FD IPC support is unavailable,
+  the call returns an error without a synchronous fallback. Tracking metadata is
+  installed when allocation submission succeeds and removed as soon as
+  `cudaFree`/`cudaFreeAsync` is accepted, not when stream-ordered allocation or
+  free work executes. NCCL Fold's blocking control plane and its different pool
+  reuse/pressure can therefore expose or hide allocation-lifetime, reuse, and
+  missing-synchronization bugs relative to native CUDA.
+* **Host progress and API return differ.** Ungrouped operations perform blocking
+  MPI metadata exchanges in the NCCL call, and grouped operations do so in the
+  outermost `ncclGroupEnd`. Matching ranks may therefore be required before the
+  calling host thread returns, which can introduce deadlocks in code that relies
+  on native NCCL's host-side return/progress behavior; the extra rendezvous can
+  also hide host/GPU progress races. Only the subsequently enqueued device work
+  remains asynchronous with respect to the host.
 * **Grouping is only a subset of NCCL grouping semantics.** Groups are
   thread-local, may nest, and defer submission until the outermost
   `ncclGroupEnd`. Submission preserves call order across P2P, collectives, and
-  communicators. A group error can still occur after some work has already been
-  enqueued, and NCCL Fold does not reproduce native atomic-launch behavior.
-* **Host blocking differs.** Ungrouped operations perform blocking MPI metadata
-  exchanges in the NCCL call, and grouped operations do so in `ncclGroupEnd`.
-  This may introduce host deadlocks in code that depends on native nonblocking
-  return, while the extra rendezvous can also hide host/GPU progress races.
-* **CUDA Graph capture is unsupported.** Event creation, CUDA IPC setup, MPI
-  calls, and host-side allocation occur while an operation is submitted; no
-  graph-capture-compatible path or replay semantics are implemented. Capture may
-  fail or behave differently rather than exposing a native-NCCL graph bug.
-* **Reduction results need not be bitwise reproducible.** NCCL Fold reduces in
-  increasing rank order with its own kernel; native NCCL may use another
-  association, instructions, or precision. In particular, half and bfloat16
-  values are converted through float for each pairwise step. Floating-point
-  results (including NaN and signed-zero handling) may differ while still
-  representing the requested reduction, so bitwise comparisons are not a valid
-  equivalence test.
-* **Device selection is collapsed.** Every intercepted `cudaSetDevice` request
-  selects device zero, and its requested ordinal is not validated. This can hide
-  invalid-device and device-placement bugs and cannot reproduce per-device
-  contexts or properties.
-* **Resource lifetime differs.** IPC-capable events are communicator-owned and
-  pooled; imported event objects are cached by IPC handle. Reduction source
-  pointer arrays use stream-ordered allocation and free. Legacy imported IPC
-  memory mappings remain cached until `ncclCommDestroy`. In contrast, imported
-  pool pointers are freed asynchronously in the consuming operation stream
-  before its done event, and the exporter waits on that event before later
-  source-stream work. Imported pool objects are communicator-owned; the local
-  export pool intentionally has process lifetime. Grouped-send snapshots are
-  legacy IPC-exported allocations and are conservatively retained. Destroy does not first synchronize
-  outstanding GPU work, so destroying a communicator before its work completes
-  remains unsupported.
-* **Bootstrap has stronger environmental constraints.** Communicator discovery
-  polls a single-host filesystem directory and has no timeout. Abnormal
-  termination can leave stale rank or tag files; a later run may fail, wait
-  forever, or consume stale identity data. This is not native NCCL's bootstrap
-  or failure behavior.
-* **Validation is not identical to NCCL.** P2P checks transferred byte counts but
-  not datatype identity; zero-count edge cases and error codes/timing have not
-  been established as equivalent. Unsupported calls may reach the real NCCL
-  library with virtual communicator handles, so applications must restrict
-  themselves to the documented interposed subset.
+  communicators. A group error can occur after some work has been enqueued, and
+  NCCL Fold does not reproduce native atomic-launch behavior.
+* **NCCL implementation and performance are not modeled.** NCCL Fold does not
+  preserve native algorithm or protocol selection, reduction trees, chunking,
+  channels, launch shapes, topology, transports, or GPUDirect/peer-access
+  behavior. Nor does it model physical multi-GPU concurrency, scheduling,
+  contention, latency, bandwidth, throughput, memory capacity, NUMA effects, or
+  hardware/transport failures. It is a correctness emulator, not a performance
+  or scalability model.
+* **Device virtualization is intentionally incomplete.** Every intercepted
+  `cudaSetDevice` request selects physical device zero and the requested ordinal
+  is not validated. All logical ranks therefore share one GPU rather than
+  independent devices. This can hide invalid-device, device-selection, placement,
+  isolation, capacity, and per-device-property bugs.
+* **Floating-point reductions are not bitwise reproducible.** NCCL Fold reduces
+  in increasing logical-rank order with its own kernel; native NCCL may use a
+  different association, instruction sequence, or intermediate precision. Half
+  and bfloat16 operands are converted to float for each pairwise operation and
+  rounded back after each step. Results, including NaN and signed-zero behavior,
+  may therefore differ bitwise while preserving the requested value-level
+  reduction semantics.
+* **Resource lifetime and caching differ.** IPC-capable events are
+  communicator-owned and pooled, and imported event objects are cached by IPC
+  handle. Legacy imported memory mappings remain cached until
+  `ncclCommDestroy`, with cache size following distinct remote allocations rather
+  than operation count; imported pool pointers are freed asynchronously in the
+  consuming stream before its done event. Imported pools are communicator-owned,
+  while the exporting pool has process lifetime. Reduction pointer arrays are
+  allocated and freed in stream order. IPC-exported grouped-send snapshots are
+  conservatively retained until communicator destruction. `ncclCommDestroy`
+  destroys these resources without first synchronizing outstanding GPU work, so
+  destruction before all such work completes is unsupported and may fail or be
+  unsafe; communicator destruction does not have native finalize semantics.
+* **Bootstrap and failure behavior are non-native.** Discovery and pool exchange
+  require a single host and use filesystem rendezvous (under
+  `/tmp/ncclfold-bootstrap-<uid>` by default, configurable with
+  `NCCL_FOLD_BOOTSTRAP_DIR`) plus Unix-domain sockets; filesystem polling
+  and socket connection have no timeout. Abnormal termination
+  can leave stale rank/tag state, and a later run may fail, wait indefinitely,
+  or consume stale identity data. NCCL Fold does not emulate native NCCL failure
+  detection, asynchronous failure reporting, abort, cancellation, timeout, or
+  recovery semantics.
+* **Validation and errors are not NCCL-equivalent.** P2P validates byte counts
+  but not datatype identity; validation coverage, zero-count edge cases, error
+  codes, error timing, partial-submission behavior, and asynchronous-error
+  reporting may differ. Unsupported NCCL symbols are not guarded by NCCL Fold
+  and may reach the real NCCL library with a virtual communicator handle, which
+  the real library does not own; doing so is unsupported and potentially unsafe.
+  Applications must call only the explicitly interposed subset.
 
 ## Implementation and stream semantics
 
@@ -307,20 +316,3 @@ Set `NCCL_FOLD_RESOURCE_STATS=1` to print per-communicator teardown accounting
 for owned event creation/pool peak, imported event opens/cache size, IPC memory
 mappings, reduction-scratch high-water mark, and retained IPC-exported grouped
 send snapshots. Normal execution does not print these statistics.
-
-### Known limitations
-
-* Communicator discovery uses a single-host filesystem rendezvous (in
-  `/tmp/ncclfold-bootstrap-<uid>` by default, or `NCCL_FOLD_BOOTSTRAP_DIR`). All
-  requested ranks must initialize with the same unique ID, size, and distinct
-  NCCL ranks. Normal completion removes rendezvous files; an abnormally killed
-  job can leave stale files that may be removed manually.
-* MPI provides host-side control-plane progress, so NCCL Fold does not reproduce
-  NCCL's nonblocking host progress, algorithms, topology, or performance.
-* IPC memory mappings remain cached until `ncclCommDestroy`; their normal cache
-  cardinality follows distinct remote allocations, not collective operation
-  count. IPC-exported grouped-send snapshots are a special retained allocation
-  class. Event pools/caches instead follow peak concurrently leased events, and
-  reduction pointer arrays are stream-ordered allocations returned immediately
-  after their kernels are enqueued.
-* NCCL reduction operators other than sum/product/min/max are unsupported.
