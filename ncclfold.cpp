@@ -1714,46 +1714,97 @@ namespace nccl_fold
         std::fflush(stderr);
     }
 
-    template <typename T>
-    __device__ T reduceValue(T a, T b, int op)
+    template <ncclRedOp_t Op>
+    struct ReductionValue;
+
+    template <>
+    struct ReductionValue<ncclSum>
     {
-        if (op == ncclSum)
+        template <typename T>
+        __device__ static T apply(T a, T b)
+        {
             return a + b;
-        if (op == ncclProd)
+        }
+        __device__ static __half apply(__half a, __half b)
+        {
+            return __float2half(__half2float(a) + __half2float(b));
+        }
+        __device__ static __nv_bfloat16 apply(__nv_bfloat16 a, __nv_bfloat16 b)
+        {
+            return __float2bfloat16(__bfloat162float(a) + __bfloat162float(b));
+        }
+    };
+
+    template <>
+    struct ReductionValue<ncclProd>
+    {
+        template <typename T>
+        __device__ static T apply(T a, T b)
+        {
             return a * b;
-        if (op == ncclMin)
+        }
+        __device__ static __half apply(__half a, __half b)
+        {
+            return __float2half(__half2float(a) * __half2float(b));
+        }
+        __device__ static __nv_bfloat16 apply(__nv_bfloat16 a, __nv_bfloat16 b)
+        {
+            return __float2bfloat16(__bfloat162float(a) * __bfloat162float(b));
+        }
+    };
+
+    template <>
+    struct ReductionValue<ncclMin>
+    {
+        template <typename T>
+        __device__ static T apply(T a, T b)
+        {
             return a < b ? a : b;
-        return a > b ? a : b;
-    }
+        }
+        __device__ static __half apply(__half a, __half b)
+        {
+            return __float2half(fminf(__half2float(a), __half2float(b)));
+        }
+        __device__ static __nv_bfloat16 apply(__nv_bfloat16 a, __nv_bfloat16 b)
+        {
+            return __float2bfloat16(fminf(__bfloat162float(a), __bfloat162float(b)));
+        }
+    };
+
     template <>
-    __device__ __half reduceValue(__half a, __half b, int op)
+    struct ReductionValue<ncclMax>
     {
-        float x = __half2float(a), y = __half2float(b);
-        float z = op == ncclSum ? x + y : op == ncclProd ? x * y
-                                      : op == ncclMin    ? fminf(x, y)
-                                                         : fmaxf(x, y);
-        return __float2half(z);
-    }
-    template <>
-    __device__ __nv_bfloat16 reduceValue(__nv_bfloat16 a, __nv_bfloat16 b, int op)
+        template <typename T>
+        __device__ static T apply(T a, T b)
+        {
+            return a > b ? a : b;
+        }
+        __device__ static __half apply(__half a, __half b)
+        {
+            return __float2half(fmaxf(__half2float(a), __half2float(b)));
+        }
+        __device__ static __nv_bfloat16 apply(__nv_bfloat16 a, __nv_bfloat16 b)
+        {
+            return __float2bfloat16(fmaxf(__bfloat162float(a), __bfloat162float(b)));
+        }
+    };
+
+    template <typename T, ncclRedOp_t Op>
+    __device__ T reduceValue(T a, T b)
     {
-        float x = __bfloat162float(a), y = __bfloat162float(b);
-        float z = op == ncclSum ? x + y : op == ncclProd ? x * y
-                                      : op == ncclMin    ? fminf(x, y)
-                                                         : fmaxf(x, y);
-        return __float2bfloat16(z);
+        return ReductionValue<Op>::apply(a, b);
     }
-    template <typename T>
+    template <typename T, ncclRedOp_t Op>
     __global__ void reductionKernel(const void *const *sources, T *output,
                                     size_t count, size_t source_offset,
-                                    int nranks, int op)
+                                    int nranks)
     {
         size_t i = blockIdx.x * blockDim.x + threadIdx.x;
         if (i >= count)
             return;
         T value = static_cast<const T *>(sources[0])[source_offset + i];
         for (int rank = 1; rank < nranks; ++rank)
-            value = reduceValue(value, static_cast<const T *>(sources[rank])[source_offset + i], op);
+            value = reduceValue<T, Op>(value, static_cast<const T *>(sources[rank])[source_offset + i]);
         output[i] = value;
     }
 
@@ -1762,14 +1813,45 @@ namespace nccl_fold
         return op == ncclSum || op == ncclProd || op == ncclMin || op == ncclMax;
     }
 
-    template <typename T>
+    template <typename T, ncclRedOp_t Op>
     static ncclResult_t launchReduction(void **device_sources, void *output,
-                                        size_t count, size_t source_offset, int nranks, ncclRedOp_t op, cudaStream_t stream)
+                                        size_t count, size_t source_offset, int nranks, cudaStream_t stream)
     {
         if (count != 0)
-            reductionKernel<T><<<(count + 255) / 256, 256, 0, stream>>>(
-                (const void *const *)device_sources, (T *)output, count, source_offset, nranks, (int)op);
+            reductionKernel<T, Op><<<(count + 255) / 256, 256, 0, stream>>>(
+                (const void *const *)device_sources, (T *)output, count, source_offset, nranks);
         return cudaToNccl(ATLC_LOG_CUDA(cudaGetLastError));
+    }
+
+    template <ncclRedOp_t Op>
+    static ncclResult_t dispatchReduction(ncclDataType_t datatype, void **device_sources, void *output,
+                                          size_t count, size_t source_offset, int nranks, cudaStream_t stream)
+    {
+        switch (datatype)
+        {
+        case ncclInt8:
+            return launchReduction<int8_t, Op>(device_sources, output, count, source_offset, nranks, stream);
+        case ncclUint8:
+            return launchReduction<uint8_t, Op>(device_sources, output, count, source_offset, nranks, stream);
+        case ncclInt32:
+            return launchReduction<int32_t, Op>(device_sources, output, count, source_offset, nranks, stream);
+        case ncclUint32:
+            return launchReduction<uint32_t, Op>(device_sources, output, count, source_offset, nranks, stream);
+        case ncclInt64:
+            return launchReduction<int64_t, Op>(device_sources, output, count, source_offset, nranks, stream);
+        case ncclUint64:
+            return launchReduction<uint64_t, Op>(device_sources, output, count, source_offset, nranks, stream);
+        case ncclFloat16:
+            return launchReduction<__half, Op>(device_sources, output, count, source_offset, nranks, stream);
+        case ncclFloat32:
+            return launchReduction<float, Op>(device_sources, output, count, source_offset, nranks, stream);
+        case ncclFloat64:
+            return launchReduction<double, Op>(device_sources, output, count, source_offset, nranks, stream);
+        case ncclBfloat16:
+            return launchReduction<__nv_bfloat16, Op>(device_sources, output, count, source_offset, nranks, stream);
+        default:
+            return ncclInvalidArgument;
+        }
     }
 
     static ncclResult_t enqueueCollective(VirtualComm *comm, const CollectiveArgs &args)
@@ -1951,40 +2033,23 @@ namespace nccl_fold
                 return result;
             }
             size_t offset = args.kind == ReduceScatter ? args.count * (size_t)comm->rank : 0;
-            switch (args.datatype)
+            switch (args.op)
             {
-            case ncclInt8:
-                result = launchReduction<int8_t>(device_sources, args.recvbuff, args.count, offset, comm->ndev, args.op, args.stream);
+            case ncclSum:
+                result = dispatchReduction<ncclSum>(args.datatype, device_sources, args.recvbuff, args.count, offset, comm->ndev, args.stream);
                 break;
-            case ncclUint8:
-                result = launchReduction<uint8_t>(device_sources, args.recvbuff, args.count, offset, comm->ndev, args.op, args.stream);
+            case ncclProd:
+                result = dispatchReduction<ncclProd>(args.datatype, device_sources, args.recvbuff, args.count, offset, comm->ndev, args.stream);
                 break;
-            case ncclInt32:
-                result = launchReduction<int32_t>(device_sources, args.recvbuff, args.count, offset, comm->ndev, args.op, args.stream);
+            case ncclMin:
+                result = dispatchReduction<ncclMin>(args.datatype, device_sources, args.recvbuff, args.count, offset, comm->ndev, args.stream);
                 break;
-            case ncclUint32:
-                result = launchReduction<uint32_t>(device_sources, args.recvbuff, args.count, offset, comm->ndev, args.op, args.stream);
-                break;
-            case ncclInt64:
-                result = launchReduction<int64_t>(device_sources, args.recvbuff, args.count, offset, comm->ndev, args.op, args.stream);
-                break;
-            case ncclUint64:
-                result = launchReduction<uint64_t>(device_sources, args.recvbuff, args.count, offset, comm->ndev, args.op, args.stream);
-                break;
-            case ncclFloat16:
-                result = launchReduction<__half>(device_sources, args.recvbuff, args.count, offset, comm->ndev, args.op, args.stream);
-                break;
-            case ncclFloat32:
-                result = launchReduction<float>(device_sources, args.recvbuff, args.count, offset, comm->ndev, args.op, args.stream);
-                break;
-            case ncclFloat64:
-                result = launchReduction<double>(device_sources, args.recvbuff, args.count, offset, comm->ndev, args.op, args.stream);
-                break;
-            case ncclBfloat16:
-                result = launchReduction<__nv_bfloat16>(device_sources, args.recvbuff, args.count, offset, comm->ndev, args.op, args.stream);
+            case ncclMax:
+                result = dispatchReduction<ncclMax>(args.datatype, device_sources, args.recvbuff, args.count, offset, comm->ndev, args.stream);
                 break;
             default:
                 result = ncclInvalidArgument;
+                break;
             }
             cudaError_t free_error = ATLC_LOG_CUDA(runtime.origCudaFreeAsync, device_sources, args.stream);
             if (free_error == cudaSuccess)
