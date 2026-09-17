@@ -44,6 +44,34 @@ An ordinary call such as
 `ncclAllReduce(send, receive, count, ncclFloat32, ncclSum, comm, stream)` is
 then executed across four logical ranks on physical device zero.
 
+### Diagnostic timeout
+
+Set `NCCL_FOLD_TIMEOUT_MS` to a positive integer to bound each NCCL Fold
+control-plane rendezvous or wait (metadata exchanges, P2P handshakes, barriers,
+bootstrap file polling, and memory-pool socket exchange). The default, and a
+value of `0`, leave timeout handling disabled. Deadlines use a monotonic clock
+and progress is polled by the existing calling thread; no progress thread,
+signal handler, or `MPI_THREAD_MULTIPLE` support is required.
+
+When a deadline expires, each rank's current/last operation snapshot is read
+from atomic, versioned files under `NCCL_FOLD_BOOTSTRAP_DIR` (or its default
+directory). The report identifies the communicator, sequence, logical rank,
+phase, operation kind, count and datatype, plus collective operator/root or P2P
+peer as applicable. NCCL Fold then flushes standard error and calls `MPI_Abort`;
+it does not attempt to cancel outstanding requests or continue. This is a
+development/debugging fail-stop facility, **not** NCCL-compatible fault
+detection or recovery.
+
+Collective metadata disagreement is reported immediately after the safe
+metadata exchange, rank by rank. Sequence, collective kind, API count,
+datatype, reduction operator, root, and computed byte count are checked, and
+the differing fields are named. A diagnosed collective mismatch returns
+`ncclInvalidUsage` to every participating rank without aborting. P2P matching
+likewise checks sequence, API count, datatype identity (including distinct
+equal-size datatypes), and byte count; a matched incompatible pair completes
+its control-plane handshake and reports `ncclInvalidUsage` to both endpoints.
+Missing ranks and wrong peers are diagnosed by the timeout snapshots.
+
 ## NCCL compatibility
 
 | NCCL API | Status | Notes |
@@ -104,8 +132,8 @@ executions:
 * **P2P value and matching semantics.** Send/Recv transfers the requested byte
   range. Operations are matched by communicator, peer, direction, and a
   monotonically increasing per-peer sequence number. The two sides must issue
-  compatible counts and datatypes; NCCL Fold checks byte counts, but does not
-  diagnose different datatypes having the same size.
+  compatible counts and datatypes; NCCL Fold checks API count, byte count, and
+  datatype identity, including datatypes that happen to have the same size.
 * **Collective order and metadata agreement.** Collectives have a
   per-communicator sequence. All ranks must enter them in the same order and
   agree on kind, root, datatype, reduction operator, and byte count; disagreement
@@ -169,8 +197,9 @@ executions:
   refers to them has completed. Applications use CUDA stream/event
   synchronization rather than NCCL API return as evidence of GPU completion.
 * The contract applies only to successful calls. Process failure, malformed or
-  stale bootstrap state, MPI/CUDA failures, cancellation, timeouts, and recovery
-  after a partial error are outside its scope.
+  stale bootstrap state, MPI/CUDA failures, cancellation, and recovery after a
+  partial error are outside its scope. The optional diagnostic timeout is
+  deliberately fail-stop rather than recovery semantics.
 
 ### Known Semantic Deviations / Limitations
 
@@ -241,14 +270,18 @@ executions:
 * **Bootstrap and failure behavior are non-native.** Discovery and pool exchange
   require a single host and use filesystem rendezvous (under
   `/tmp/ncclfold-bootstrap-<uid>` by default, configurable with
-  `NCCL_FOLD_BOOTSTRAP_DIR`) plus Unix-domain sockets; filesystem polling
-  and socket connection have no timeout. Abnormal termination
+  `NCCL_FOLD_BOOTSTRAP_DIR`) plus Unix-domain sockets. With
+  `NCCL_FOLD_TIMEOUT_MS` enabled, filesystem polling, socket exchange, and the
+  associated MPI barriers/allreduce are bounded and fail-stop. Abnormal termination
   can leave stale rank/tag state, and a later run may fail, wait indefinitely,
-  or consume stale identity data. NCCL Fold does not emulate native NCCL failure
-  detection, asynchronous failure reporting, abort, cancellation, timeout, or
+  or consume stale identity data. `MPI_Comm_create_group` itself, MPI calls that
+  unexpectedly fail to return from `MPI_Testall`, CUDA runtime/driver calls,
+  filesystem syscalls such as `fsync`, and communicator destruction cannot be
+  safely bounded here and may still block. NCCL Fold does not emulate native
+  NCCL failure detection, asynchronous failure reporting, cancellation, or
   recovery semantics.
 * **Validation and errors are not NCCL-equivalent.** P2P validates byte counts
-  but not datatype identity; validation coverage, zero-count edge cases, error
+  plus API count and datatype identity; validation coverage, zero-count edge cases, error
   codes, error timing, partial-submission behavior, and asynchronous-error
   reporting may differ. Unsupported NCCL symbols are not guarded by NCCL Fold
   and may reach the real NCCL library with a virtual communicator handle, which

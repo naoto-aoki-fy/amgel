@@ -14,9 +14,12 @@
 #include <cerrno>
 #include <climits>
 #include <string>
+#include <thread>
+#include <poll.h>
 
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 
 #include <dlfcn.h>
@@ -58,12 +61,17 @@ namespace nccl_fold {
         memoryDescriptor memory;
         cudaIpcEventHandle_t ready;
         uint64_t bytes;
+        uint64_t count;
         uint64_t sequence;
+        int datatype;
     } readyMessage;
 
     typedef struct {
         cudaIpcEventHandle_t done;
+        uint64_t count;
         uint64_t sequence;
+        int datatype;
+        int status;
     } doneMessage;
 
     typedef struct {
@@ -127,11 +135,13 @@ namespace nccl_fold {
         MPI_Comm mpi_comm;
         int rank;
         int ndev;
+        uint64_t fingerprint;
+        std::string diagnostic_directory;
         std::mutex sequence_mutex;
 
         VirtualComm() : magic(MAGIC), event_pool_peak(0), scratch_in_flight(0),
             scratch_high_water(0), scratch_allocations_submitted(0), collective_sequence(0),
-            mpi_comm(MPI_COMM_NULL), rank(-1), ndev(0) {}
+            mpi_comm(MPI_COMM_NULL), rank(-1), ndev(0), fingerprint(0) {}
     };
 
     struct RuntimeState {
@@ -318,6 +328,150 @@ namespace nccl_fold {
         return hash;
     }
 
+    static uint64_t timeoutMilliseconds() {
+        static uint64_t value = []() -> uint64_t {
+            const char* text = std::getenv("NCCL_FOLD_TIMEOUT_MS");
+            if (!text || !*text) return 0;
+            char* end = NULL; errno = 0;
+            unsigned long long parsed = std::strtoull(text, &end, 10);
+            if (*text == '-' || errno || *end || parsed > UINT64_MAX) {
+                std::fprintf(stderr, "NCCL Fold: ignoring invalid NCCL_FOLD_TIMEOUT_MS=%s\n", text);
+                return 0;
+            }
+            return (uint64_t)parsed;
+        }();
+        return value;
+    }
+
+    enum DiagnosticClass : uint32_t { DiagBootstrap, DiagCollective, DiagSend, DiagRecv, DiagGroup };
+    enum DiagnosticState : uint32_t { DiagEntered, DiagWaiting, DiagCompleted };
+    struct DiagnosticSnapshot {
+        uint64_t magic;
+        uint32_t version, record_size;
+        uint64_t fingerprint, sequence, count;
+        int32_t rank, size, operation, state, kind, peer, datatype, reduction, root, group_index;
+        char phase[48];
+    };
+    static const uint64_t DIAGNOSTIC_MAGIC = UINT64_C(0x4e43464c44494147);
+    static bool writeAll(int fd, const void* data, size_t bytes);
+
+    static const char* collectiveName(int kind) {
+        static const char* names[] = {"Broadcast", "AllGather", "Reduce", "AllReduce",
+            "ReduceScatter", "AlltoAll", "Gather", "Scatter"};
+        return kind >= 0 && kind < 8 ? names[kind] : "unknown";
+    }
+    static const char* datatypeName(int datatype) {
+        switch (datatype) {
+            case ncclInt8: return "ncclInt8"; case ncclUint8: return "ncclUint8";
+            case ncclInt32: return "ncclInt32"; case ncclUint32: return "ncclUint32";
+            case ncclInt64: return "ncclInt64"; case ncclUint64: return "ncclUint64";
+            case ncclFloat16: return "ncclFloat16"; case ncclFloat32: return "ncclFloat32";
+            case ncclFloat64: return "ncclFloat64"; case ncclBfloat16: return "ncclBfloat16";
+            default: return "unknown";
+        }
+    }
+    static const char* reductionName(int op) {
+        switch (op) { case ncclSum: return "ncclSum"; case ncclProd: return "ncclProd";
+            case ncclMin: return "ncclMin"; case ncclMax: return "ncclMax"; default: return "n/a"; }
+    }
+
+    static bool atomicReplace(const std::string& path, const void* data, size_t bytes) {
+        static std::atomic<uint64_t> serial(0);
+        std::string temporary = path + ".tmp-" + std::to_string((long long)getpid()) + "-" +
+                                std::to_string((unsigned long long)++serial);
+        int fd = open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd < 0) return false;
+        bool ok = writeAll(fd, data, bytes) && fsync(fd) == 0;
+        close(fd);
+        if (ok) ok = rename(temporary.c_str(), path.c_str()) == 0;
+        if (!ok) unlink(temporary.c_str());
+        return ok;
+    }
+
+    static std::string snapshotPath(const VirtualComm* comm, int rank) {
+        return comm->diagnostic_directory + "/snapshot-" + std::to_string(rank);
+    }
+    static void publishSnapshot(VirtualComm* comm, DiagnosticClass operation, uint64_t sequence,
+            const char* phase, DiagnosticState state, int kind = -1, uint64_t count = 0,
+            int datatype = -1, int reduction = -1, int root = -1, int peer = -1, int group_index = -1) {
+        if (!timeoutMilliseconds() || !comm || comm->diagnostic_directory.empty()) return;
+        DiagnosticSnapshot snapshot = {};
+        snapshot.magic = DIAGNOSTIC_MAGIC; snapshot.version = 1; snapshot.record_size = sizeof(snapshot);
+        snapshot.fingerprint = comm->fingerprint; snapshot.sequence = sequence; snapshot.count = count;
+        snapshot.rank = comm->rank; snapshot.size = comm->ndev; snapshot.operation = operation;
+        snapshot.state = state; snapshot.kind = kind; snapshot.peer = peer; snapshot.datatype = datatype;
+        snapshot.reduction = reduction; snapshot.root = root; snapshot.group_index = group_index;
+        std::snprintf(snapshot.phase, sizeof(snapshot.phase), "%s", phase ? phase : "unknown");
+        atomicReplace(snapshotPath(comm, comm->rank), &snapshot, sizeof(snapshot));
+    }
+    static bool readSnapshot(const VirtualComm* comm, int rank, DiagnosticSnapshot* snapshot) {
+        int fd = open(snapshotPath(comm, rank).c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return false;
+        size_t left = sizeof(*snapshot); char* out = reinterpret_cast<char*>(snapshot);
+        while (left) { ssize_t n = read(fd, out, left); if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) { close(fd); return false; } out += n; left -= (size_t)n; }
+        close(fd);
+        return snapshot->magic == DIAGNOSTIC_MAGIC && snapshot->version == 1 &&
+            snapshot->record_size == sizeof(*snapshot) && snapshot->fingerprint == comm->fingerprint &&
+            snapshot->rank == rank && snapshot->size == comm->ndev;
+    }
+    [[noreturn]] static void timeoutAbort(VirtualComm* comm, MPI_Comm mpi_comm,
+            const char* phase, uint64_t sequence) {
+        std::fprintf(stderr, "NCCL Fold timeout: phase=%s comm=%016llx seq=%llu timeout_ms=%llu\n\n",
+            phase, (unsigned long long)(comm ? comm->fingerprint : 0),
+            (unsigned long long)sequence, (unsigned long long)timeoutMilliseconds());
+        if (comm) for (int rank = 0; rank < comm->ndev; ++rank) {
+            DiagnosticSnapshot s;
+            if (!readSnapshot(comm, rank, &s)) { std::fprintf(stderr, "rank %d: no valid/current snapshot\n", rank); continue; }
+            const char* state = s.state == DiagCompleted ? "last completed" : s.state == DiagWaiting ? "waiting" : "entered";
+            if (s.operation == DiagCollective)
+                std::fprintf(stderr, "rank %d: %s collective seq=%llu %s count=%llu dtype=%s op=%s root=%d phase=%s\n",
+                    rank, state, (unsigned long long)s.sequence, collectiveName(s.kind),
+                    (unsigned long long)s.count, datatypeName(s.datatype), reductionName(s.reduction), s.root, s.phase);
+            else std::fprintf(stderr, "rank %d: %s %s seq=%llu peer=%d count=%llu dtype=%s phase=%s\n",
+                    rank, state, s.operation == DiagSend ? "send" : s.operation == DiagRecv ? "recv" :
+                    s.operation == DiagGroup ? "group" : "bootstrap", (unsigned long long)s.sequence,
+                    s.peer, (unsigned long long)s.count, datatypeName(s.datatype), s.phase);
+        }
+        std::fprintf(stderr, "\npossible protocol divergence: not all ranks reached the same control-plane rendezvous\n"
+            "NCCL Fold: aborting after diagnostic timeout; recovery is not supported\n");
+        std::fflush(stderr);
+        MPI_Abort(mpi_comm == MPI_COMM_NULL ? MPI_COMM_WORLD : mpi_comm, 124);
+        _exit(124);
+    }
+
+    static ncclResult_t timedWait(MPI_Request* requests, int count, VirtualComm* comm,
+            MPI_Comm mpi_comm, const char* phase, uint64_t sequence) {
+        if (!count) return ncclSuccess;
+        if (!timeoutMilliseconds()) return MPI_Waitall(count, requests, MPI_STATUSES_IGNORE) == MPI_SUCCESS ? ncclSuccess : ncclSystemError;
+        const std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(timeoutMilliseconds());
+        for (;;) {
+            int complete = 0;
+            int error = MPI_Testall(count, requests, &complete, MPI_STATUSES_IGNORE);
+            if (error != MPI_SUCCESS) return ncclSystemError;
+            if (complete) return ncclSuccess;
+            if (std::chrono::steady_clock::now() >= deadline) timeoutAbort(comm, mpi_comm, phase, sequence);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    static ncclResult_t timedBarrier(VirtualComm* comm, MPI_Comm mpi_comm, const char* phase, uint64_t sequence) {
+        if (!timeoutMilliseconds()) return MPI_Barrier(mpi_comm) == MPI_SUCCESS ? ncclSuccess : ncclSystemError;
+        MPI_Request request = MPI_REQUEST_NULL;
+        if (MPI_Ibarrier(mpi_comm, &request) != MPI_SUCCESS) return ncclSystemError;
+        return timedWait(&request, 1, comm, mpi_comm, phase, sequence);
+    }
+    static ncclResult_t timedAllgather(const void* send, int send_count, MPI_Datatype send_type,
+            void* receive, int receive_count, MPI_Datatype receive_type, VirtualComm* comm,
+            const char* phase, uint64_t sequence) {
+        if (!timeoutMilliseconds()) return MPI_Allgather(send, send_count, send_type, receive,
+            receive_count, receive_type, comm->mpi_comm) == MPI_SUCCESS ? ncclSuccess : ncclSystemError;
+        MPI_Request request = MPI_REQUEST_NULL;
+        if (MPI_Iallgather(send, send_count, send_type, receive, receive_count, receive_type,
+                comm->mpi_comm, &request) != MPI_SUCCESS) return ncclSystemError;
+        return timedWait(&request, 1, comm, comm->mpi_comm, phase, sequence);
+    }
+
     static bool makeDirectory(const std::string& path) {
         return mkdir(path.c_str(), 0700) == 0 || errno == EEXIST;
     }
@@ -390,6 +544,8 @@ namespace nccl_fold {
         std::string rank_path = directory + "/rank-" + std::to_string(rank);
         if (!publishFile(rank_path, &local, sizeof(local))) return ncclInvalidUsage;
 
+        const std::chrono::steady_clock::time_point bootstrap_deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(timeoutMilliseconds());
         std::vector<int> members(ndev, -1);
         for (;;) {
             bool complete = true;
@@ -402,6 +558,8 @@ namespace nccl_fold {
                 members[r] = peer.world_rank;
             }
             if (complete) break;
+            if (timeoutMilliseconds() && std::chrono::steady_clock::now() >= bootstrap_deadline)
+                timeoutAbort(NULL, MPI_COMM_WORLD, "bootstrap-rank-files", 0);
             usleep(1000);
         }
         std::vector<int> sorted = members;
@@ -434,6 +592,8 @@ namespace nccl_fold {
                     ssize_t got = read(fd, &tag, sizeof(tag)); close(fd);
                     if (got == (ssize_t)sizeof(tag)) break;
                 }
+                if (timeoutMilliseconds() && std::chrono::steady_clock::now() >= bootstrap_deadline)
+                    timeoutAbort(NULL, MPI_COMM_WORLD, "bootstrap-tag-file", 0);
                 usleep(1000);
             }
         }
@@ -448,7 +608,7 @@ namespace nccl_fold {
 
         /* Ensure no later communicator can reuse this creation tag until every
          * member has left MPI_Comm_create_group. */
-        if (MPI_Barrier(*result) != MPI_SUCCESS) { MPI_Comm_free(result); return ncclSystemError; }
+        if (timedBarrier(NULL, *result, "bootstrap-barrier", 0) != ncclSuccess) { MPI_Comm_free(result); return ncclSystemError; }
         if (rank == 0) {
             unlink((root + "/tag-" + std::to_string(tag)).c_str());
             unlink(tag_selection.c_str());
@@ -493,7 +653,12 @@ namespace nccl_fold {
         cudaMemPool_t pool = NULL;
         int available = getExportPool(&pool) == cudaSuccess ? 1 : 0;
         int available_count = 0;
-        if (MPI_Allreduce(&available, &available_count, 1, MPI_INT, MPI_SUM, comm->mpi_comm) != MPI_SUCCESS)
+        if (timeoutMilliseconds()) {
+            MPI_Request request = MPI_REQUEST_NULL;
+            if (MPI_Iallreduce(&available, &available_count, 1, MPI_INT, MPI_SUM, comm->mpi_comm, &request) != MPI_SUCCESS ||
+                timedWait(&request, 1, comm, comm->mpi_comm, "pool-capability-allreduce", 0) != ncclSuccess)
+                return ncclSystemError;
+        } else if (MPI_Allreduce(&available, &available_count, 1, MPI_INT, MPI_SUM, comm->mpi_comm) != MPI_SUCCESS)
             return ncclSystemError;
         comm->imported_pools.assign(comm->ndev, NULL);
         /* Legacy-only programs remain usable on devices without pool IPC, but
@@ -522,13 +687,24 @@ namespace nccl_fold {
             listen(listener, comm->ndev) != 0) {
             if (listener >= 0) close(listener); close(pool_fd); return ncclSystemError;
         }
-        if (MPI_Barrier(comm->mpi_comm) != MPI_SUCCESS) { close(listener); close(pool_fd); unlink(path.c_str()); return ncclSystemError; }
+        if (timedBarrier(comm, comm->mpi_comm, "pool-listener-barrier", 0) != ncclSuccess) { close(listener); close(pool_fd); unlink(path.c_str()); return ncclSystemError; }
         ncclResult_t result = ncclSuccess;
+        const std::chrono::steady_clock::time_point socket_deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(timeoutMilliseconds());
         for (int peer = 0; peer < comm->ndev && result == ncclSuccess; ++peer) {
             if (peer == comm->rank) continue;
             int channel = -1;
             if (peer < comm->rank) {
-                do { channel = accept4(listener, NULL, NULL, SOCK_CLOEXEC); } while (channel < 0 && errno == EINTR);
+                if (timeoutMilliseconds()) {
+                    for (;;) {
+                        struct pollfd descriptor = {listener, POLLIN, 0};
+                        int ready = poll(&descriptor, 1, 1);
+                        if (ready > 0) { channel = accept4(listener, NULL, NULL, SOCK_CLOEXEC); if (channel >= 0) break; }
+                        if (ready < 0 && errno != EINTR) break;
+                        if (std::chrono::steady_clock::now() >= socket_deadline)
+                            timeoutAbort(comm, comm->mpi_comm, "pool-socket-accept", 0);
+                    }
+                } else do { channel = accept4(listener, NULL, NULL, SOCK_CLOEXEC); } while (channel < 0 && errno == EINTR);
             } else {
                 channel = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
                 struct sockaddr_un remote = {}; remote.sun_family = AF_UNIX;
@@ -536,12 +712,25 @@ namespace nccl_fold {
                 std::strncpy(remote.sun_path, remote_path.c_str(), sizeof(remote.sun_path)-1);
                 while (channel >= 0 && connect(channel, reinterpret_cast<sockaddr*>(&remote), sizeof(remote)) != 0) {
                     if (errno != EINTR && errno != ENOENT && errno != ECONNREFUSED) { close(channel); channel = -1; break; }
+                    if (timeoutMilliseconds() && std::chrono::steady_clock::now() >= socket_deadline)
+                        timeoutAbort(comm, comm->mpi_comm, "pool-socket-connect", 0);
                     usleep(1000);
                 }
             }
+            if (channel >= 0 && timeoutMilliseconds()) {
+                struct timeval timeout = {(time_t)(timeoutMilliseconds() / 1000),
+                    (suseconds_t)((timeoutMilliseconds() % 1000) * 1000)};
+                setsockopt(channel, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+                setsockopt(channel, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            }
             int remote_fd = -1, remote_rank = -1;
-            if (channel < 0 || !sendFd(channel, pool_fd, comm->rank) ||
-                (remote_fd = receiveFd(channel, &remote_rank)) < 0 || remote_rank < 0 ||
+            bool sent = channel >= 0 && sendFd(channel, pool_fd, comm->rank);
+            if (timeoutMilliseconds() && channel >= 0 && !sent && (errno == EAGAIN || errno == EWOULDBLOCK))
+                timeoutAbort(comm, comm->mpi_comm, "pool-socket-send", 0);
+            if (sent) remote_fd = receiveFd(channel, &remote_rank);
+            if (timeoutMilliseconds() && sent && remote_fd < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                timeoutAbort(comm, comm->mpi_comm, "pool-socket-receive", 0);
+            if (!sent || remote_fd < 0 || remote_rank < 0 ||
                 remote_rank >= comm->ndev || remote_rank == comm->rank ||
                 comm->imported_pools[remote_rank])
                 result = ncclSystemError;
@@ -554,7 +743,7 @@ namespace nccl_fold {
             } else if (remote_fd >= 0) close(remote_fd);
         }
         close(pool_fd); close(listener); unlink(path.c_str());
-        MPI_Barrier(comm->mpi_comm);
+        if (timedBarrier(comm, comm->mpi_comm, "pool-cleanup-barrier", 0) != ncclSuccess) return ncclSystemError;
         if (comm->rank == 0) rmdir(directory.c_str());
         return result;
     }
@@ -586,6 +775,17 @@ namespace nccl_fold {
         }
         virtual_comm->rank = rank;
         virtual_comm->ndev = ndev;
+        virtual_comm->fingerprint = hashId(nccl_id, UINT64_C(1469598103934665603));
+        if (timeoutMilliseconds()) {
+            const char* configured = std::getenv("NCCL_FOLD_BOOTSTRAP_DIR");
+            std::string root = configured && *configured ? configured : "/tmp/ncclfold-bootstrap-" + std::to_string((long long)getuid());
+            char name[48]; std::snprintf(name, sizeof(name), "/diagnostics-%016llx",
+                (unsigned long long)virtual_comm->fingerprint);
+            virtual_comm->diagnostic_directory = root + name;
+            if (!makeDirectory(root) || !makeDirectory(virtual_comm->diagnostic_directory))
+                timeoutAbort(virtual_comm, virtual_comm->mpi_comm, "diagnostic-bootstrap", 0);
+            publishSnapshot(virtual_comm, DiagBootstrap, 0, "pool-exchange", DiagWaiting);
+        }
         int mpi_rank = -1, mpi_size = 0;
         MPI_Comm_rank(virtual_comm->mpi_comm, &mpi_rank);
         MPI_Comm_size(virtual_comm->mpi_comm, &mpi_size);
@@ -739,7 +939,9 @@ namespace nccl_fold {
             result = cudaCheck(runtime.cudaIpcGetEventHandle(&message.ready, ready), "runtime.cudaIpcGetEventHandle(ready)");
             if (result != ncclSuccess) return result;
             message.bytes = op.count * type_size;
+            message.count = op.count;
             message.sequence = op.sequence;
+            message.datatype = op.datatype;
             if (debugEnabled()) std::fprintf(stderr, "NCCL Fold comm=%p rank=%d peer=%d seq=%llu ready=%p stream=%p send\n",
                 (void*)comm, comm->rank, op.peer, (unsigned long long)op.sequence, (void*)ready, (void*)op.stream);
         }
@@ -754,7 +956,13 @@ namespace nccl_fold {
             if (result != ncclSuccess) return result;
         }
         if (!requests.empty()) {
-            ncclResult_t result = mpiCheck(MPI_Waitall((int)requests.size(), requests.data(), MPI_STATUSES_IGNORE), "MPI_Waitall(ready metadata)");
+            publishSnapshot(comm, send_count ? DiagSend : DiagRecv,
+                send_count ? send_args[0].sequence : recv_args[0].sequence, "p2p-ready-metadata", DiagWaiting,
+                -1, send_count ? send_args[0].count : recv_args[0].count,
+                send_count ? send_args[0].datatype : recv_args[0].datatype, -1, -1,
+                send_count ? send_args[0].peer : recv_args[0].peer);
+            ncclResult_t result = timedWait(requests.data(), (int)requests.size(), comm, comm->mpi_comm,
+                "p2p-ready-metadata", send_count ? send_args[0].sequence : recv_args[0].sequence);
             if (result != ncclSuccess) return result;
         }
 
@@ -766,7 +974,19 @@ namespace nccl_fold {
             uint64_t const type_size = sizeofNcclDataType(op.datatype);
             if (type_size == 0 || op.count > UINT64_MAX / type_size) return ncclInvalidArgument;
             uint64_t const recv_bytes = op.count * type_size;
-            if (message.sequence != op.sequence || message.bytes != recv_bytes) deferred_error = ncclInvalidArgument;
+            bool mismatch = message.sequence != op.sequence || message.count != op.count ||
+                            message.datatype != op.datatype || message.bytes != recv_bytes;
+            if (mismatch) {
+                deferred_error = ncclInvalidUsage;
+                std::fprintf(stderr, "NCCL Fold P2P mismatch: comm=%016llx ranks=%d/%d\n"
+                    "send: seq=%llu count=%llu dtype=%s bytes=%llu\n"
+                    "recv: seq=%llu count=%llu dtype=%s bytes=%llu\n",
+                    (unsigned long long)comm->fingerprint, op.peer, comm->rank,
+                    (unsigned long long)message.sequence, (unsigned long long)message.count,
+                    datatypeName(message.datatype), (unsigned long long)message.bytes,
+                    (unsigned long long)op.sequence, (unsigned long long)op.count,
+                    datatypeName(op.datatype), (unsigned long long)recv_bytes);
+            }
 
             cudaEvent_t ready = NULL;
             cudaEvent_t done = NULL;
@@ -778,7 +998,7 @@ namespace nccl_fold {
             if (result != ncclSuccess) return result;
             result = cudaCheck(runtime.cudaStreamWaitEvent(op.stream, ready, 0), "runtime.cudaStreamWaitEvent(ready)");
             if (result != ncclSuccess) return result;
-            if (message.bytes == recv_bytes) {
+            if (!mismatch && message.bytes == recv_bytes) {
                 result = cudaCheck(runtime.cudaMemcpyAsync(op.buff, (char*)source + message.memory.offset, recv_bytes,
                     cudaMemcpyDeviceToDevice, op.stream), "runtime.cudaMemcpyAsync(P2P)");
                 if (result != ncclSuccess) return result;
@@ -794,6 +1014,9 @@ namespace nccl_fold {
             result = cudaCheck(runtime.cudaIpcGetEventHandle(&outgoing_done[i].done, done), "runtime.cudaIpcGetEventHandle(done)");
             if (result != ncclSuccess) return result;
             outgoing_done[i].sequence = message.sequence;
+            outgoing_done[i].count = op.count;
+            outgoing_done[i].datatype = op.datatype;
+            outgoing_done[i].status = mismatch ? ncclInvalidUsage : ncclSuccess;
             if (debugEnabled()) std::fprintf(stderr, "NCCL Fold comm=%p rank=%d peer=%d seq=%llu done=%p stream=%p recv\n",
                 (void*)comm, comm->rank, op.peer, (unsigned long long)message.sequence, (void*)done, (void*)op.stream);
         }
@@ -808,7 +1031,8 @@ namespace nccl_fold {
             if (result != ncclSuccess) return result;
         }
         if (!requests.empty()) {
-            ncclResult_t result = mpiCheck(MPI_Waitall((int)requests.size(), requests.data(), MPI_STATUSES_IGNORE), "MPI_Waitall(done metadata)");
+            ncclResult_t result = timedWait(requests.data(), (int)requests.size(), comm, comm->mpi_comm,
+                "p2p-done-metadata", send_count ? send_args[0].sequence : recv_args[0].sequence);
             if (result != ncclSuccess) return result;
         }
         /* Matching done metadata implies that the receiver issued the ready
@@ -816,7 +1040,9 @@ namespace nccl_fold {
         for (size_t i = 0; i < send_count; ++i)
             if (incoming_done[i].sequence == send_args[i].sequence) releaseEvent(comm, ready_slots[i]);
         for (size_t i = 0; i < send_count; ++i) {
-            if (incoming_done[i].sequence != send_args[i].sequence) deferred_error = ncclInvalidArgument;
+            if (incoming_done[i].sequence != send_args[i].sequence || incoming_done[i].count != send_args[i].count ||
+                incoming_done[i].datatype != send_args[i].datatype || incoming_done[i].status != ncclSuccess)
+                deferred_error = ncclInvalidUsage;
             cudaEvent_t done = NULL;
             ncclResult_t result = openEvent(comm, incoming_done[i].done, &done, "cudaIpcOpenEventHandle(done)");
             if (result != ncclSuccess) return result;
@@ -838,13 +1064,19 @@ namespace nccl_fold {
             if (result != ncclSuccess) return result;
         }
         if (!requests.empty()) {
-            ncclResult_t result = mpiCheck(MPI_Waitall((int)requests.size(), requests.data(), MPI_STATUSES_IGNORE), "MPI_Waitall(done ack)");
+            ncclResult_t result = timedWait(requests.data(), (int)requests.size(), comm, comm->mpi_comm,
+                "p2p-done-ack", send_count ? send_args[0].sequence : recv_args[0].sequence);
             if (result != ncclSuccess) return result;
         }
         for (size_t i = 0; i < recv_count; ++i) {
-            if (acknowledgements[i] != recv_args[i].sequence) deferred_error = ncclInvalidArgument;
+            if (acknowledgements[i] != recv_args[i].sequence) deferred_error = ncclInvalidUsage;
             else releaseEvent(comm, done_slots[i]);
         }
+        publishSnapshot(comm, send_count ? DiagSend : DiagRecv,
+            send_count ? send_args[0].sequence : recv_args[0].sequence, "p2p-complete", DiagCompleted,
+            -1, send_count ? send_args[0].count : recv_args[0].count,
+            send_count ? send_args[0].datatype : recv_args[0].datatype, -1, -1,
+            send_count ? send_args[0].peer : recv_args[0].peer);
         return deferred_error;
     }
 
@@ -883,7 +1115,8 @@ namespace nccl_fold {
                 }
                 if ((result = leaseEvent(grouped.comm, &p.event_slot, &p.local_event)) != ncclSuccess) return result;
                 if ((result = cudaCheck(runtime.cudaIpcGetEventHandle(&p.ready.ready, p.local_event), "cudaIpcGetEventHandle(group send ready)")) != ncclSuccess) return result;
-                p.ready.bytes = bytes; p.ready.sequence = op.sequence;
+                p.ready.bytes = bytes; p.ready.count = op.count; p.ready.sequence = op.sequence;
+                p.ready.datatype = op.datatype;
                 if ((result = mpiCheck(MPI_Isend(&p.ready, sizeof(p.ready), MPI_BYTE, op.peer, readyTag, grouped.comm->mpi_comm, &request), "MPI_Isend(group ready)")) != ncclSuccess) return result;
                 requests.push_back(request);
                 if ((result = mpiCheck(MPI_Irecv(&p.done, sizeof(p.done), MPI_BYTE, op.peer, doneTag, grouped.comm->mpi_comm, &request), "MPI_Irecv(group done)")) != ncclSuccess) return result;
@@ -892,7 +1125,8 @@ namespace nccl_fold {
                 if (bytes && getAllocation(op.buff, bytes, NULL) == NULL) return ncclInvalidArgument;
                 if ((result = leaseEvent(grouped.comm, &p.event_slot, &p.local_event)) != ncclSuccess) return result;
                 if ((result = cudaCheck(runtime.cudaIpcGetEventHandle(&p.done.done, p.local_event), "cudaIpcGetEventHandle(group recv done)")) != ncclSuccess) return result;
-                p.done.sequence = op.sequence;
+                p.done.sequence = op.sequence; p.done.count = op.count; p.done.datatype = op.datatype;
+                p.done.status = ncclSuccess;
                 if ((result = mpiCheck(MPI_Irecv(&p.ready, sizeof(p.ready), MPI_BYTE, op.peer, readyTag, grouped.comm->mpi_comm, &request), "MPI_Irecv(group ready)")) != ncclSuccess) return result;
                 requests.push_back(request);
                 if ((result = mpiCheck(MPI_Isend(&p.done, sizeof(p.done), MPI_BYTE, op.peer, doneTag, grouped.comm->mpi_comm, &request), "MPI_Isend(group done)")) != ncclSuccess) return result;
@@ -900,14 +1134,25 @@ namespace nccl_fold {
             }
         }
         if (requests.empty()) return ncclSuccess;
-        return mpiCheck(MPI_Waitall((int)requests.size(), requests.data(), MPI_STATUSES_IGNORE), "MPI_Waitall(group P2P metadata)");
+        VirtualComm* comm = operations.empty() ? NULL : operations[0].comm;
+        uint64_t sequence = operations.empty() ? 0 : operations[0].p2p.sequence;
+        if (comm) publishSnapshot(comm, DiagGroup, sequence, "group-p2p-metadata", DiagWaiting);
+        return timedWait(requests.data(), (int)requests.size(), comm,
+            comm ? comm->mpi_comm : MPI_COMM_WORLD, "group-p2p-metadata", sequence);
     }
 
     static ncclResult_t enqueuePreparedGroupP2P(GroupOp const& grouped, PreparedGroupP2P const& p) {
         sendRecvArgs_t const& op = grouped.p2p;
         ncclResult_t result;
         if (grouped.kind == GroupSend) {
-            if (p.done.sequence != op.sequence) return ncclInvalidArgument;
+            if (p.done.sequence != op.sequence || p.done.count != op.count || p.done.datatype != op.datatype) {
+                std::fprintf(stderr, "NCCL Fold grouped P2P mismatch: comm=%016llx peer=%d "
+                    "send(seq=%llu count=%llu dtype=%s) recv(seq=%llu count=%llu dtype=%s)\n",
+                    (unsigned long long)grouped.comm->fingerprint, op.peer,
+                    (unsigned long long)op.sequence, (unsigned long long)op.count, datatypeName(op.datatype),
+                    (unsigned long long)p.done.sequence, (unsigned long long)p.done.count, datatypeName(p.done.datatype));
+                return ncclInvalidUsage;
+            }
             uint64_t const bytes = op.count * sizeofNcclDataType(op.datatype);
             if (bytes && (result = cudaCheck(runtime.cudaMemcpyAsync(p.send_snapshot, op.buff, bytes, cudaMemcpyDeviceToDevice, op.stream), "cudaMemcpyAsync(group send snapshot)")) != ncclSuccess) return result;
             if ((result = cudaCheck(runtime.cudaEventRecord(p.local_event, op.stream), "cudaEventRecord(group send ready)")) != ncclSuccess) return result;
@@ -915,7 +1160,17 @@ namespace nccl_fold {
         }
         uint64_t const type_size = sizeofNcclDataType(op.datatype);
         uint64_t const bytes = op.count * type_size;
-        if (p.ready.sequence != op.sequence || p.ready.bytes != bytes) return ncclInvalidArgument;
+        if (p.ready.sequence != op.sequence || p.ready.count != op.count ||
+            p.ready.datatype != op.datatype || p.ready.bytes != bytes) {
+            std::fprintf(stderr, "NCCL Fold grouped P2P mismatch: comm=%016llx peer=%d "
+                "send(seq=%llu count=%llu dtype=%s bytes=%llu) recv(seq=%llu count=%llu dtype=%s bytes=%llu)\n",
+                (unsigned long long)grouped.comm->fingerprint, op.peer,
+                (unsigned long long)p.ready.sequence, (unsigned long long)p.ready.count,
+                datatypeName(p.ready.datatype), (unsigned long long)p.ready.bytes,
+                (unsigned long long)op.sequence, (unsigned long long)op.count,
+                datatypeName(op.datatype), (unsigned long long)bytes);
+            return ncclInvalidUsage;
+        }
         cudaEvent_t ready = NULL;
         void* source = NULL;
         bool temporary_source = false;
@@ -939,12 +1194,38 @@ namespace nccl_fold {
         memoryDescriptor memory;
         cudaIpcEventHandle_t ready;
         uint64_t bytes;
+        uint64_t count;
         uint64_t sequence;
         int kind;
         int datatype;
         int op;
         int root;
     };
+
+    static void reportCollectiveMismatch(VirtualComm* comm,
+            const std::vector<CollectiveDescriptor>& descriptors) {
+        if (comm->rank != 0 || descriptors.empty()) return;
+        const CollectiveDescriptor& first = descriptors[0];
+        bool sequence=false, kind=false, count=false, datatype=false, op=false, root=false, bytes=false;
+        std::fprintf(stderr, "NCCL Fold collective mismatch: comm=%016llx seq=%llu\n\n",
+            (unsigned long long)comm->fingerprint, (unsigned long long)first.sequence);
+        for (int rank=0; rank<comm->ndev; ++rank) {
+            const CollectiveDescriptor& d = descriptors[rank];
+            std::fprintf(stderr, "rank %d: seq=%llu %-13s count=%llu dtype=%s op=%s root=%d bytes=%llu\n",
+                rank, (unsigned long long)d.sequence, collectiveName(d.kind),
+                (unsigned long long)d.count, datatypeName(d.datatype), reductionName(d.op), d.root,
+                (unsigned long long)d.bytes);
+            sequence |= d.sequence != first.sequence; kind |= d.kind != first.kind;
+            count |= d.count != first.count; datatype |= d.datatype != first.datatype;
+            op |= d.op != first.op; root |= d.root != first.root; bytes |= d.bytes != first.bytes;
+        }
+        std::fprintf(stderr, "\ndifference:");
+        if (sequence) std::fprintf(stderr, " sequence"); if (kind) std::fprintf(stderr, " collective-kind");
+        if (count) std::fprintf(stderr, " count"); if (datatype) std::fprintf(stderr, " datatype");
+        if (op) std::fprintf(stderr, " reduction-op"); if (root) std::fprintf(stderr, " root");
+        if (bytes) std::fprintf(stderr, " byte-count");
+        std::fprintf(stderr, "\n"); std::fflush(stderr);
+    }
 
     template <typename T> __device__ T reduceValue(T a, T b, int op) {
         if (op == ncclSum) return a + b;
@@ -1010,7 +1291,7 @@ namespace nccl_fold {
             return ncclInvalidArgument;
 
         CollectiveDescriptor local = {};
-        local.bytes = source_bytes; local.sequence = comm->collective_sequence++;
+        local.bytes = source_bytes; local.count = args.count; local.sequence = comm->collective_sequence++;
         local.kind = args.kind; local.datatype = args.datatype; local.op = reduction ? args.op : 0; local.root = args.root;
         AllocationKind allocation_kind = LegacyAllocation;
         void* allocation = has_source ? getAllocation(const_cast<void*>(args.sendbuff), source_bytes,
@@ -1032,13 +1313,22 @@ namespace nccl_fold {
         if ((result = cudaCheck(runtime.cudaIpcGetEventHandle(&local.ready, ready), "cudaIpcGetEventHandle(collective ready)")) != ncclSuccess) return result;
 
         std::vector<CollectiveDescriptor> descriptors(comm->ndev);
-        if ((result = mpiCheck(MPI_Allgather(&local, sizeof(local), MPI_BYTE, descriptors.data(), sizeof(local), MPI_BYTE, comm->mpi_comm), "MPI_Allgather(collective metadata)")) != ncclSuccess) return result;
+        publishSnapshot(comm, DiagCollective, local.sequence, "collective-metadata", DiagWaiting,
+            args.kind, args.count, args.datatype, reduction ? args.op : -1, args.root);
+        if ((result = timedAllgather(&local, sizeof(local), MPI_BYTE, descriptors.data(), sizeof(local),
+                MPI_BYTE, comm, "collective-metadata", local.sequence)) != ncclSuccess) return result;
+        bool descriptor_mismatch = false;
+        for (int rank = 0; rank < comm->ndev; ++rank) {
+            const CollectiveDescriptor& d = descriptors[rank];
+            descriptor_mismatch |= d.sequence != local.sequence || d.kind != local.kind ||
+                d.count != local.count || d.datatype != local.datatype || d.op != local.op ||
+                d.root != local.root || d.bytes != local.bytes;
+        }
+        if (descriptor_mismatch) { reportCollectiveMismatch(comm, descriptors); return ncclInvalidUsage; }
         std::vector<void*> sources(comm->ndev);
         std::vector<void*> imported_pool_pointers;
         for (int rank = 0; rank < comm->ndev; ++rank) {
             const CollectiveDescriptor& d = descriptors[rank];
-            if (d.sequence != local.sequence || d.kind != local.kind || d.datatype != local.datatype ||
-                d.op != local.op || d.root != local.root || d.bytes != local.bytes) return ncclInvalidUsage;
             bool need_rank = (args.kind != Broadcast && args.kind != Scatter) || rank == args.root;
             if (!need_rank) continue;
             if (rank == comm->rank) sources[rank] = const_cast<void*>(args.sendbuff);
@@ -1051,7 +1341,7 @@ namespace nccl_fold {
                 sources[rank] = (char*)base + d.memory.offset;
             }
         }
-        if ((result = mpiCheck(MPI_Barrier(comm->mpi_comm), "MPI_Barrier(collective ready leases)")) != ncclSuccess) return result;
+        if ((result = timedBarrier(comm, comm->mpi_comm, "collective-ready-leases", local.sequence)) != ncclSuccess) return result;
         releaseEvent(comm, ready_slot);
 
         if (args.kind == Broadcast) {
@@ -1131,14 +1421,17 @@ namespace nccl_fold {
         cudaIpcEventHandle_t local_done;
         if ((result = cudaCheck(runtime.cudaIpcGetEventHandle(&local_done, done), "cudaIpcGetEventHandle(collective done)")) != ncclSuccess) return result;
         std::vector<cudaIpcEventHandle_t> dones(comm->ndev);
-        if ((result = mpiCheck(MPI_Allgather(&local_done, sizeof(local_done), MPI_BYTE, dones.data(), sizeof(local_done), MPI_BYTE, comm->mpi_comm), "MPI_Allgather(collective done)")) != ncclSuccess) return result;
+        if ((result = timedAllgather(&local_done, sizeof(local_done), MPI_BYTE, dones.data(), sizeof(local_done),
+                MPI_BYTE, comm, "collective-done", local.sequence)) != ncclSuccess) return result;
         for (int rank=0; rank<comm->ndev; ++rank) if (rank != comm->rank) {
             cudaEvent_t event = NULL;
             if ((result = openEvent(comm, dones[rank], &event, "cudaIpcOpenEventHandle(collective done)")) != ncclSuccess) return result;
             if ((result = cudaCheck(runtime.cudaStreamWaitEvent(args.stream, event, 0), "cudaStreamWaitEvent(collective done)")) != ncclSuccess) return result;
         }
-        if ((result = mpiCheck(MPI_Barrier(comm->mpi_comm), "MPI_Barrier(collective done leases)")) != ncclSuccess) return result;
+        if ((result = timedBarrier(comm, comm->mpi_comm, "collective-done-leases", local.sequence)) != ncclSuccess) return result;
         releaseEvent(comm, done_slot);
+        publishSnapshot(comm, DiagCollective, local.sequence, "collective-complete", DiagCompleted,
+            args.kind, args.count, args.datatype, reduction ? args.op : -1, args.root);
         return ncclSuccess;
     }
 
@@ -1187,10 +1480,15 @@ namespace nccl_fold {
                     ackTag, op.comm->mpi_comm, &request), "MPI_Irecv(group event ack)")) != ncclSuccess) return result;
             acknowledgements.push_back(request);
         }
-        if (!acknowledgements.empty() && (result = mpiCheck(MPI_Waitall((int)acknowledgements.size(),
-                acknowledgements.data(), MPI_STATUSES_IGNORE), "MPI_Waitall(group event ack)")) != ncclSuccess) return result;
+        if (!acknowledgements.empty()) {
+            VirtualComm* comm = operations.empty() ? NULL : operations[0].comm;
+            uint64_t sequence = operations.empty() ? 0 : operations[0].p2p.sequence;
+            result = timedWait(acknowledgements.data(), (int)acknowledgements.size(), comm,
+                comm ? comm->mpi_comm : MPI_COMM_WORLD, "group-event-ack", sequence);
+            if (result != ncclSuccess) return result;
+        }
         for (size_t i = 0; i < operations.size(); ++i) if (operations[i].kind != GroupCollective) {
-            if (received[i] != operations[i].p2p.sequence) return ncclInvalidArgument;
+            if (received[i] != operations[i].p2p.sequence) return ncclInvalidUsage;
             releaseEvent(operations[i].comm, prepared[i].event_slot);
         }
         return ncclSuccess;
@@ -1320,6 +1618,12 @@ namespace nccl_fold {
         }
 
         ncclResult_t result = ncclSuccess;
+        if (!comm->diagnostic_directory.empty()) {
+            unlink(snapshotPath(comm, comm->rank).c_str());
+            /* The directory removal is best-effort: another rank may still be
+             * destroying, and leaving an empty directory is harmless. */
+            rmdir(comm->diagnostic_directory.c_str());
+        }
         if (resourceStatsEnabled())
             std::fprintf(stderr, "NCCL Fold resources comm=%p rank=%d owned_events_created=%zu "
                 "event_pool_peak=%zu imported_events_opened=%zu imported_event_cache=%zu "
