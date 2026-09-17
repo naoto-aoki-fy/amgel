@@ -21,10 +21,11 @@ FRIDA_SO = $(FRIDA_DIR)/so
 FRIDA_CORE_SO = $(FRIDA_DIR)/so/libfrida-core.so
 FRIDA_GUM_SO = $(FRIDA_DIR)/so/libfrida-gum.so
 
-.PHONY: target differential differential-run
+.PHONY: target test semantic-test differential differential-run
 target: ncclfold.so
 
 DIFFERENTIAL_BIN ?= tests/differential/nccl_semantics_test
+SEMANTIC_BIN ?= tests/semantic/nccl_semantics_test
 
 differential: $(DIFFERENTIAL_BIN)
 
@@ -32,8 +33,21 @@ $(DIFFERENTIAL_BIN): tests/differential/nccl_semantics_test.cu
 	$(NVCC) $(CFLAGS_VENDOR) -std=c++14 -Wno-deprecated-gpu-targets $(GENCODE_FLAGS) $< \
 		$(LDFLAGS_VENDOR) --cudart=shared -lmpi -lnccl -o $@
 
+$(SEMANTIC_BIN): tests/differential/nccl_semantics_test.cu
+	$(NVCC) $(CFLAGS_VENDOR) -std=c++14 -Wno-deprecated-gpu-targets $(GENCODE_FLAGS) $< \
+		$(LDFLAGS_VENDOR) --cudart=shared -lmpi -lnccl -o $@
+
 differential-run: differential ncclfold.so
 	python3 tests/differential/run_differential.py --ncclfold ./ncclfold.so
+
+# The public, single-GPU correctness suite.  TEST_RANKS and TEST_ARGS make it
+# easy for CI and local installations to select rank counts or launcher flags.
+TEST_RANKS ?= 2,4
+TEST_ARGS ?=
+semantic-test: $(SEMANTIC_BIN) ncclfold.so
+	python3 tests/semantic/run_semantic.py --ranks $(TEST_RANKS) --ncclfold ./ncclfold.so $(TEST_ARGS)
+
+test: semantic-test
 
 ncclfold.so: ncclfold_dynamic.so
 	ln -sf $(CURDIR)/$< ncclfold.so
@@ -78,4 +92,4 @@ ncclfold_dynamic.so: ncclfold.cpp $(FRIDA_CORE_SO) $(FRIDA_GUM_SO)
 
 .PHONY: clean
 clean:
-	$(RM) ncclfold.so ncclfold_dynamic.so ncclfold_static.so $(DIFFERENTIAL_BIN)
+	$(RM) ncclfold.so ncclfold_dynamic.so ncclfold_static.so $(DIFFERENTIAL_BIN) $(SEMANTIC_BIN)

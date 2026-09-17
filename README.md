@@ -44,6 +44,20 @@ An ordinary call such as
 `ncclAllReduce(send, receive, count, ncclFloat32, ncclSum, comm, stream)` is
 then executed across four logical ranks on physical device zero.
 
+## Single-GPU semantic tests
+
+After building NCCL Fold, run the public correctness suite on one physical GPU:
+
+```sh
+make test
+```
+
+This launches both two- and four-rank MPI jobs with `ncclfold.so` preloaded and
+checks results against an independent deterministic value oracle. It does not
+need a native multi-GPU reference system. See
+[`tests/semantic/README.md`](tests/semantic/README.md) for coverage, launcher
+configuration, version-dependent skips, tolerances, and focused commands.
+
 ## Differential correctness tests
 
 `tests/differential` contains a native-NCCL oracle suite for the supported
