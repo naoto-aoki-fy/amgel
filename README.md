@@ -201,11 +201,15 @@ NCCL Fold does **not** preserve the following:
   selects device zero, and its requested ordinal is not validated. This can hide
   invalid-device and device-placement bugs and cannot reproduce per-device
   contexts or properties.
-* **Resource lifetime differs.** Imported IPC mappings, event handles, owned
-  events, and reduction pointer arrays are retained until `ncclCommDestroy`.
-  Destroy does not first synchronize outstanding GPU work. Compared with native
-  NCCL this can increase resource consumption, delay failures, or cause unsafe
-  teardown if the application destroys a communicator too early.
+* **Resource lifetime differs.** IPC-capable events are communicator-owned and
+  pooled; imported event objects are cached by IPC handle. Reduction source
+  pointer arrays use stream-ordered allocation and free. Imported IPC memory
+  mappings remain cached until `ncclCommDestroy`, because closing a mapping
+  requires coordination with both queued remote work and the exporting
+  allocation. Grouped-send snapshots are IPC-exported allocations and are also
+  conservatively retained for that reason. Destroy does not first synchronize
+  outstanding GPU work, so destroying a communicator before its work completes
+  remains unsupported.
 * **Bootstrap has stronger environmental constraints.** Communicator discovery
   polls a single-host filesystem directory and has no timeout. Abnormal
   termination can leave stale rank or tag files; a later run may fail, wait
@@ -224,7 +228,7 @@ containing exactly the processes which initialize it with the same
 `ncclUniqueId`. Its MPI ranks are ordered by the requested NCCL ranks, so
 subsets and reordered ranks work without involving other `MPI_COMM_WORLD`
 processes. Each communicator has its own MPI communicator, rank, size, sequence
-counters, CUDA IPC mappings, events, and reduction scratch storage. Communicators
+counters, CUDA IPC mappings, event pools, and reduction scratch accounting. Communicators
 therefore do not share a singleton operation state. CUDA allocation metadata records both
 base and size and is removed by intercepted `cudaFree`/`cudaFreeAsync` calls.
 
@@ -251,6 +255,22 @@ without permitting premature reuse of the user's source buffer.
 P2P uses the same ready/copy/done dependency scheme. Set `NCCL_FOLD_DEBUG_P2P=1`
 to log communicator, rank, peer, sequence, event, stream, and direction.
 
+Event slots have an explicit host-side lease. For ordinary P2P, receipt of done
+metadata proves that the receiver submitted its ready wait; a subsequent ACK
+proves that the sender submitted its done wait. Grouped P2P exchanges symmetric
+ACKs after all waits are submitted. Collectives use communicator-wide host
+barriers after ready waits and after done waits. These handshakes do not wait for
+GPU completion: CUDA waits bind to the event generation current when the wait is
+submitted, so the exporter may then safely re-record the slot. Imported events
+are opened once per distinct pooled handle. Reduction source-pointer arrays are
+allocated, copied, consumed, and freed in order on the operation stream using
+the original (uninterposed) `cudaMallocAsync`/`cudaFreeAsync` functions.
+
+Set `NCCL_FOLD_RESOURCE_STATS=1` to print per-communicator teardown accounting
+for owned event creation/pool peak, imported event opens/cache size, IPC memory
+mappings, reduction-scratch high-water mark, and retained IPC-exported grouped
+send snapshots. Normal execution does not print these statistics.
+
 ### Known limitations
 
 * Communicator discovery uses a single-host filesystem rendezvous (in
@@ -260,7 +280,10 @@ to log communicator, rank, peer, sequence, event, stream, and direction.
   job can leave stale files that may be removed manually.
 * MPI provides host-side control-plane progress, so NCCL Fold does not reproduce
   NCCL's nonblocking host progress, algorithms, topology, or performance.
-* IPC mappings, events, and reduction pointer arrays are retained until
-  `ncclCommDestroy`, favoring safe asynchronous lifetime over bounded scratch
-  resource use.
+* IPC memory mappings remain cached until `ncclCommDestroy`; their normal cache
+  cardinality follows distinct remote allocations, not collective operation
+  count. IPC-exported grouped-send snapshots are a special retained allocation
+  class. Event pools/caches instead follow peak concurrently leased events, and
+  reduction pointer arrays are stream-ordered allocations returned immediately
+  after their kernels are enqueued.
 * NCCL reduction operators other than sum/product/min/max are unsupported.
