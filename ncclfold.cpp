@@ -16,6 +16,8 @@
 #include <string>
 
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include <dlfcn.h>
 #include <libelf.h>
@@ -34,15 +36,26 @@
 
 namespace nccl_fold {
 
+#if CUDART_VERSION < 11030
+#error "NCCL Fold requires CUDA 11.3 or newer for memory-pool IPC"
+#endif
+
     static GumInterceptor *interceptor = NULL;
 
-    typedef struct {
-        cudaIpcMemHandle_t handle;
-        uint64_t offset;
-    } handleOffset;
+    enum AllocationKind : uint32_t { LegacyAllocation = 1, PoolAllocation = 2 };
 
     typedef struct {
-        handleOffset memory;
+        uint32_t kind;
+        uint32_t reserved;
+        union {
+            cudaIpcMemHandle_t legacy;
+            cudaMemPoolPtrExportData pool;
+        } handle;
+        uint64_t offset;
+    } memoryDescriptor;
+
+    typedef struct {
+        memoryDescriptor memory;
         cudaIpcEventHandle_t ready;
         uint64_t bytes;
         uint64_t sequence;
@@ -100,6 +113,7 @@ namespace nccl_fold {
         std::vector<EventSlot> event_pool;
         std::vector<ImportedEvent> imported_event_cache;
         std::vector<importedMemory> ipc_mappings;
+        std::vector<cudaMemPool_t> imported_pools;
         /* IPC-exported grouped-send snapshots cannot be reclaimed while a
          * remote cached mapping may remain open.  They are not reduction scratch. */
         std::vector<void*> retained_ipc_allocations;
@@ -121,8 +135,12 @@ namespace nccl_fold {
     };
 
     struct RuntimeState {
-        std::map<uintptr_t, size_t> allocations;
+        struct Allocation { size_t size; AllocationKind kind; };
+        std::map<uintptr_t, Allocation> allocations;
         std::mutex pointer_mutex;
+        cudaMemPool_t export_pool;
+        cudaError_t pool_status;
+        std::once_flag pool_once;
         std::unordered_set<VirtualComm*> communicators;
         std::mutex communicator_mutex;
         decltype(&::cudaMalloc<void>) origCudaMalloc;
@@ -160,6 +178,7 @@ namespace nccl_fold {
         decltype(&::cudaIpcGetEventHandle) cudaIpcGetEventHandle;
         decltype(&::cudaIpcOpenEventHandle) cudaIpcOpenEventHandle;
         decltype(&::cudaStreamWaitEvent) cudaStreamWaitEvent;
+        RuntimeState() : export_pool(NULL), pool_status(cudaErrorNotSupported) {}
     };
 
     static RuntimeState runtime;
@@ -185,21 +204,47 @@ namespace nccl_fold {
         return comm;
     }
 
+    static void initializeExportPool() {
+        int pools = 0, handles = 0;
+        cudaError_t error = cudaDeviceGetAttribute(&pools, cudaDevAttrMemoryPoolsSupported, 0);
+        if (error == cudaSuccess)
+            error = cudaDeviceGetAttribute(&handles, cudaDevAttrMemoryPoolSupportedHandleTypes, 0);
+        if (error != cudaSuccess || !pools || !(handles & cudaMemHandleTypePosixFileDescriptor)) {
+            runtime.pool_status = error == cudaSuccess ? cudaErrorNotSupported : error;
+            return;
+        }
+        cudaMemPoolProps properties = {};
+        properties.allocType = cudaMemAllocationTypePinned;
+        properties.handleTypes = cudaMemHandleTypePosixFileDescriptor;
+        properties.location.type = cudaMemLocationTypeDevice;
+        properties.location.id = 0;
+        runtime.pool_status = cudaMemPoolCreate(&runtime.export_pool, &properties);
+        /* The exporting pool deliberately has process lifetime.  Destroying it
+         * from a library destructor is unsafe during CUDA runtime teardown. */
+    }
+
+    static cudaError_t getExportPool(cudaMemPool_t* pool) {
+        std::call_once(runtime.pool_once, initializeExportPool);
+        if (runtime.pool_status == cudaSuccess) *pool = runtime.export_pool;
+        return runtime.pool_status;
+    }
+
     static cudaError_t cudaMalloc(void **devPtr, size_t size) {
         cudaError_t const ret = runtime.origCudaMalloc(devPtr, size);
         if (ret == cudaSuccess) {
             std::lock_guard<std::mutex> lock(runtime.pointer_mutex);
-            runtime.allocations[(uintptr_t)*devPtr] = size;
+            runtime.allocations[(uintptr_t)*devPtr] = {size, LegacyAllocation};
         }
         return ret;
     }
 
     static cudaError_t cudaMallocAsync(void **devPtr, size_t size, cudaStream_t stream) {
-        cudaError_t const ret = runtime.origCudaMalloc(devPtr, size);
-        /* We cannot use buffer allocated with cudaMalloAsync for cudaIpcGetMemHandle */
+        cudaMemPool_t pool = NULL;
+        cudaError_t ret = getExportPool(&pool);
+        if (ret == cudaSuccess) ret = cudaMallocFromPoolAsync(devPtr, size, pool, stream);
         if (ret == cudaSuccess) {
             std::lock_guard<std::mutex> lock(runtime.pointer_mutex);
-            runtime.allocations[(uintptr_t)*devPtr] = size;
+            runtime.allocations[(uintptr_t)*devPtr] = {size, PoolAllocation};
         }
         return ret;
     }
@@ -413,15 +458,118 @@ namespace nccl_fold {
         return ncclSuccess;
     }
 
-    void* getAllocation(void* pointer_input, size_t bytes, uint64_t* offset) {
+    static bool sendFd(int socket, int fd, int rank) {
+        struct iovec iov = {&rank, sizeof(rank)};
+        char control[CMSG_SPACE(sizeof(int))] = {};
+        struct msghdr message = {};
+        message.msg_iov = &iov; message.msg_iovlen = 1;
+        message.msg_control = control; message.msg_controllen = sizeof(control);
+        struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+        header->cmsg_level = SOL_SOCKET; header->cmsg_type = SCM_RIGHTS;
+        header->cmsg_len = CMSG_LEN(sizeof(int));
+        std::memcpy(CMSG_DATA(header), &fd, sizeof(fd));
+        ssize_t sent;
+        do { sent = sendmsg(socket, &message, 0); } while (sent < 0 && errno == EINTR);
+        return sent == (ssize_t)sizeof(rank);
+    }
+
+    static int receiveFd(int socket, int* rank) {
+        char control[CMSG_SPACE(sizeof(int))] = {};
+        struct iovec iov = {rank, sizeof(*rank)};
+        struct msghdr message = {};
+        message.msg_iov = &iov; message.msg_iovlen = 1;
+        message.msg_control = control; message.msg_controllen = sizeof(control);
+        ssize_t received;
+        do { received = recvmsg(socket, &message, 0); } while (received < 0 && errno == EINTR);
+        if (received != (ssize_t)sizeof(*rank) || (message.msg_flags & MSG_CTRUNC)) return -1;
+        struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+        if (!header || header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
+            header->cmsg_len != CMSG_LEN(sizeof(int))) return -1;
+        int fd = -1; std::memcpy(&fd, CMSG_DATA(header), sizeof(fd));
+        return fd;
+    }
+
+    static ncclResult_t exchangePools(VirtualComm* comm) {
+        cudaMemPool_t pool = NULL;
+        int available = getExportPool(&pool) == cudaSuccess ? 1 : 0;
+        int available_count = 0;
+        if (MPI_Allreduce(&available, &available_count, 1, MPI_INT, MPI_SUM, comm->mpi_comm) != MPI_SUCCESS)
+            return ncclSystemError;
+        comm->imported_pools.assign(comm->ndev, NULL);
+        /* Legacy-only programs remain usable on devices without pool IPC, but
+         * cudaMallocAsync itself returns cudaErrorNotSupported (never a sync fallback). */
+        if (available_count == 0) return ncclSuccess;
+        if (available_count != comm->ndev) return ncclSystemError;
+        int pool_fd = -1;
+        if (cudaMemPoolExportToShareableHandle(&pool_fd, pool,
+                cudaMemHandleTypePosixFileDescriptor, 0) != cudaSuccess) return ncclUnhandledCudaError;
+
+        const char* configured = std::getenv("NCCL_FOLD_BOOTSTRAP_DIR");
+        std::string root = configured && *configured ? configured : "/tmp/ncclfold-bootstrap-" + std::to_string((long long)getuid());
+        uint64_t h1 = hashId(comm->unique_id, UINT64_C(1469598103934665603));
+        uint64_t h2 = hashId(comm->unique_id, UINT64_C(7809847782465536322));
+        char name[64]; std::snprintf(name, sizeof(name), "/pool-%016llx-%016llx",
+            (unsigned long long)h1, (unsigned long long)h2);
+        std::string directory = root + name;
+        if (!makeDirectory(root) || !makeDirectory(directory)) { close(pool_fd); return ncclSystemError; }
+        std::string path = directory + "/rank-" + std::to_string(comm->rank);
+        int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct sockaddr_un address = {}; address.sun_family = AF_UNIX;
+        if (path.size() >= sizeof(address.sun_path)) { close(pool_fd); if (listener >= 0) close(listener); return ncclSystemError; }
+        std::strncpy(address.sun_path, path.c_str(), sizeof(address.sun_path)-1);
+        unlink(path.c_str());
+        if (listener < 0 || bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+            listen(listener, comm->ndev) != 0) {
+            if (listener >= 0) close(listener); close(pool_fd); return ncclSystemError;
+        }
+        if (MPI_Barrier(comm->mpi_comm) != MPI_SUCCESS) { close(listener); close(pool_fd); unlink(path.c_str()); return ncclSystemError; }
+        ncclResult_t result = ncclSuccess;
+        for (int peer = 0; peer < comm->ndev && result == ncclSuccess; ++peer) {
+            if (peer == comm->rank) continue;
+            int channel = -1;
+            if (peer < comm->rank) {
+                do { channel = accept4(listener, NULL, NULL, SOCK_CLOEXEC); } while (channel < 0 && errno == EINTR);
+            } else {
+                channel = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+                struct sockaddr_un remote = {}; remote.sun_family = AF_UNIX;
+                std::string remote_path = directory + "/rank-" + std::to_string(peer);
+                std::strncpy(remote.sun_path, remote_path.c_str(), sizeof(remote.sun_path)-1);
+                while (channel >= 0 && connect(channel, reinterpret_cast<sockaddr*>(&remote), sizeof(remote)) != 0) {
+                    if (errno != EINTR && errno != ENOENT && errno != ECONNREFUSED) { close(channel); channel = -1; break; }
+                    usleep(1000);
+                }
+            }
+            int remote_fd = -1, remote_rank = -1;
+            if (channel < 0 || !sendFd(channel, pool_fd, comm->rank) ||
+                (remote_fd = receiveFd(channel, &remote_rank)) < 0 || remote_rank < 0 ||
+                remote_rank >= comm->ndev || remote_rank == comm->rank ||
+                comm->imported_pools[remote_rank])
+                result = ncclSystemError;
+            if (channel >= 0) close(channel);
+            if (result == ncclSuccess) {
+                cudaError_t error = cudaMemPoolImportFromShareableHandle(&comm->imported_pools[remote_rank],
+                    &remote_fd, cudaMemHandleTypePosixFileDescriptor, 0);
+                close(remote_fd);
+                if (error != cudaSuccess) result = ncclUnhandledCudaError;
+            } else if (remote_fd >= 0) close(remote_fd);
+        }
+        close(pool_fd); close(listener); unlink(path.c_str());
+        MPI_Barrier(comm->mpi_comm);
+        if (comm->rank == 0) rmdir(directory.c_str());
+        return result;
+    }
+
+    void* getAllocation(void* pointer_input, size_t bytes, uint64_t* offset,
+                        AllocationKind* kind = NULL) {
         std::lock_guard<std::mutex> lock(runtime.pointer_mutex);
         uintptr_t p = (uintptr_t)pointer_input;
-        std::map<uintptr_t, size_t>::iterator it = runtime.allocations.upper_bound(p);
+        std::map<uintptr_t, RuntimeState::Allocation>::iterator it = runtime.allocations.upper_bound(p);
         if (it == runtime.allocations.begin()) return NULL;
         --it;
         size_t delta = p - it->first;
-        if (delta > it->second || bytes > it->second - delta) return NULL;
+        if (delta > it->second.size || bytes > it->second.size - delta) return NULL;
         if (offset) *offset = delta;
+        if (kind) *kind = it->second.kind;
         return (void*)it->first;
     }
 
@@ -444,6 +592,10 @@ namespace nccl_fold {
         if (mpi_rank != rank || mpi_size != ndev) { MPI_Comm_free(&virtual_comm->mpi_comm); delete virtual_comm; return ncclSystemError; }
         virtual_comm->next_send_sequence.assign(ndev, 0);
         virtual_comm->next_recv_sequence.assign(ndev, 0);
+        ncclResult_t pool_exchange = exchangePools(virtual_comm);
+        if (pool_exchange != ncclSuccess) {
+            MPI_Comm_free(&virtual_comm->mpi_comm); delete virtual_comm; return pool_exchange;
+        }
         {
             std::lock_guard<std::mutex> lock(runtime.communicator_mutex);
             runtime.communicators.insert(virtual_comm);
@@ -521,6 +673,15 @@ namespace nccl_fold {
 
     enum { readyTag = 17001, doneTag = 17002, ackTag = 17003 };
 
+    static ncclResult_t exportMemory(void* allocation, AllocationKind kind,
+                                     memoryDescriptor* descriptor, uint64_t offset) {
+        descriptor->kind = kind; descriptor->reserved = 0; descriptor->offset = offset;
+        cudaError_t error = kind == LegacyAllocation
+            ? runtime.cudaIpcGetMemHandle(&descriptor->handle.legacy, allocation)
+            : cudaMemPoolExportPointer(&descriptor->handle.pool, allocation);
+        return cudaCheck(error, kind == LegacyAllocation ? "cudaIpcGetMemHandle" : "cudaMemPoolExportPointer");
+    }
+
     static ncclResult_t openMemory(VirtualComm* comm, cudaIpcMemHandle_t const& handle, void** pointer) {
         for (size_t i = 0; i < comm->ipc_mappings.size(); ++i) {
             if (std::memcmp(&comm->ipc_mappings[i].handle, &handle, sizeof(handle)) == 0) {
@@ -530,6 +691,19 @@ namespace nccl_fold {
         }
         ncclResult_t result = cudaCheck(runtime.cudaIpcOpenMemHandle(pointer, handle, cudaIpcMemLazyEnablePeerAccess), "cudaIpcOpenMemHandle");
         if (result == ncclSuccess) comm->ipc_mappings.push_back({handle, *pointer});
+        return result;
+    }
+
+    static ncclResult_t importMemory(VirtualComm* comm, int exporter,
+            memoryDescriptor const& descriptor, void** pointer, bool* temporary) {
+        *temporary = false;
+        if (descriptor.kind == LegacyAllocation)
+            return openMemory(comm, descriptor.handle.legacy, pointer);
+        if (descriptor.kind != PoolAllocation || exporter < 0 || exporter >= comm->ndev ||
+            !comm->imported_pools[exporter]) return ncclInvalidArgument;
+        ncclResult_t result = cudaCheck(cudaMemPoolImportPointer(pointer,
+            comm->imported_pools[exporter], &descriptor.handle.pool), "cudaMemPoolImportPointer");
+        if (result == ncclSuccess) *temporary = true;
         return result;
     }
 
@@ -552,9 +726,10 @@ namespace nccl_fold {
             readyMessage& message = outgoing[i];
             uint64_t type_size = sizeofNcclDataType(op.datatype);
             if (type_size == 0 || op.count > UINT64_MAX / type_size) return ncclInvalidArgument;
-            void* allocation = getAllocation(op.buff, op.count * type_size, &message.memory.offset);
+            AllocationKind allocation_kind;
+            void* allocation = getAllocation(op.buff, op.count * type_size, &message.memory.offset, &allocation_kind);
             if (allocation == NULL) return ncclInvalidArgument;
-            ncclResult_t result = cudaCheck(runtime.cudaIpcGetMemHandle(&message.memory.handle, allocation), "cudaIpcGetMemHandle");
+            ncclResult_t result = exportMemory(allocation, allocation_kind, &message.memory, message.memory.offset);
             if (result != ncclSuccess) return result;
             cudaEvent_t ready = NULL;
             result = leaseEvent(comm, &ready_slots[i], &ready);
@@ -596,15 +771,20 @@ namespace nccl_fold {
             cudaEvent_t ready = NULL;
             cudaEvent_t done = NULL;
             void* source = NULL;
+            bool temporary_source = false;
             ncclResult_t result = openEvent(comm, message.ready, &ready, "cudaIpcOpenEventHandle(ready)");
             if (result != ncclSuccess) return result;
-            result = openMemory(comm, message.memory.handle, &source);
+            result = importMemory(comm, op.peer, message.memory, &source, &temporary_source);
             if (result != ncclSuccess) return result;
             result = cudaCheck(runtime.cudaStreamWaitEvent(op.stream, ready, 0), "runtime.cudaStreamWaitEvent(ready)");
             if (result != ncclSuccess) return result;
             if (message.bytes == recv_bytes) {
                 result = cudaCheck(runtime.cudaMemcpyAsync(op.buff, (char*)source + message.memory.offset, recv_bytes,
                     cudaMemcpyDeviceToDevice, op.stream), "runtime.cudaMemcpyAsync(P2P)");
+                if (result != ncclSuccess) return result;
+            }
+            if (temporary_source) {
+                result = cudaCheck(runtime.origCudaFreeAsync(source, op.stream), "cudaFreeAsync(imported P2P pointer)");
                 if (result != ncclSuccess) return result;
             }
             result = leaseEvent(comm, &done_slots[i], &done);
@@ -699,7 +879,7 @@ namespace nccl_fold {
                 if (bytes) {
                     if ((result = cudaCheck(runtime.origCudaMalloc(&p.send_snapshot, bytes), "cudaMalloc(group send snapshot)")) != ncclSuccess) return result;
                     grouped.comm->retained_ipc_allocations.push_back(p.send_snapshot);
-                    if ((result = cudaCheck(runtime.cudaIpcGetMemHandle(&p.ready.memory.handle, p.send_snapshot), "cudaIpcGetMemHandle(group send snapshot)")) != ncclSuccess) return result;
+                    if ((result = exportMemory(p.send_snapshot, LegacyAllocation, &p.ready.memory, 0)) != ncclSuccess) return result;
                 }
                 if ((result = leaseEvent(grouped.comm, &p.event_slot, &p.local_event)) != ncclSuccess) return result;
                 if ((result = cudaCheck(runtime.cudaIpcGetEventHandle(&p.ready.ready, p.local_event), "cudaIpcGetEventHandle(group send ready)")) != ncclSuccess) return result;
@@ -738,10 +918,12 @@ namespace nccl_fold {
         if (p.ready.sequence != op.sequence || p.ready.bytes != bytes) return ncclInvalidArgument;
         cudaEvent_t ready = NULL;
         void* source = NULL;
+        bool temporary_source = false;
         if ((result = openEvent(grouped.comm, p.ready.ready, &ready, "cudaIpcOpenEventHandle(group ready)")) != ncclSuccess) return result;
-        if (bytes && (result = openMemory(grouped.comm, p.ready.memory.handle, &source)) != ncclSuccess) return result;
+        if (bytes && (result = importMemory(grouped.comm, op.peer, p.ready.memory, &source, &temporary_source)) != ncclSuccess) return result;
         if ((result = cudaCheck(runtime.cudaStreamWaitEvent(op.stream, ready, 0), "cudaStreamWaitEvent(group ready)")) != ncclSuccess) return result;
         if (bytes && (result = cudaCheck(runtime.cudaMemcpyAsync(op.buff, (char*)source + p.ready.memory.offset, bytes, cudaMemcpyDeviceToDevice, op.stream), "cudaMemcpyAsync(group P2P)")) != ncclSuccess) return result;
+        if (temporary_source && (result = cudaCheck(runtime.origCudaFreeAsync(source, op.stream), "cudaFreeAsync(imported group P2P pointer)")) != ncclSuccess) return result;
         return cudaCheck(runtime.cudaEventRecord(p.local_event, op.stream), "cudaEventRecord(group recv done)");
     }
 
@@ -754,7 +936,7 @@ namespace nccl_fold {
     }
 
     struct CollectiveDescriptor {
-        handleOffset memory;
+        memoryDescriptor memory;
         cudaIpcEventHandle_t ready;
         uint64_t bytes;
         uint64_t sequence;
@@ -830,14 +1012,16 @@ namespace nccl_fold {
         CollectiveDescriptor local = {};
         local.bytes = source_bytes; local.sequence = comm->collective_sequence++;
         local.kind = args.kind; local.datatype = args.datatype; local.op = reduction ? args.op : 0; local.root = args.root;
-        void* allocation = has_source ? getAllocation(const_cast<void*>(args.sendbuff), source_bytes, &local.memory.offset) : NULL;
+        AllocationKind allocation_kind = LegacyAllocation;
+        void* allocation = has_source ? getAllocation(const_cast<void*>(args.sendbuff), source_bytes,
+                                                        &local.memory.offset, &allocation_kind) : NULL;
         if (source_bytes && has_source && !allocation) return ncclInvalidArgument;
         const bool rank_wide_output = args.kind == AllGather || args.kind == AlltoAll || args.kind == Gather;
         if (rank_wide_output && block_bytes > SIZE_MAX / (size_t)comm->ndev) return ncclInvalidArgument;
         size_t output_bytes = rank_wide_output ? block_bytes * comm->ndev : block_bytes;
         if (produces_output && output_bytes && !getAllocation(args.recvbuff, output_bytes, NULL)) return ncclInvalidArgument;
         if (source_bytes && has_source) {
-            ncclResult_t result = cudaCheck(runtime.cudaIpcGetMemHandle(&local.memory.handle, allocation), "cudaIpcGetMemHandle(collective)");
+            ncclResult_t result = exportMemory(allocation, allocation_kind, &local.memory, local.memory.offset);
             if (result != ncclSuccess) return result;
         }
         cudaEvent_t ready = NULL;
@@ -850,6 +1034,7 @@ namespace nccl_fold {
         std::vector<CollectiveDescriptor> descriptors(comm->ndev);
         if ((result = mpiCheck(MPI_Allgather(&local, sizeof(local), MPI_BYTE, descriptors.data(), sizeof(local), MPI_BYTE, comm->mpi_comm), "MPI_Allgather(collective metadata)")) != ncclSuccess) return result;
         std::vector<void*> sources(comm->ndev);
+        std::vector<void*> imported_pool_pointers;
         for (int rank = 0; rank < comm->ndev; ++rank) {
             const CollectiveDescriptor& d = descriptors[rank];
             if (d.sequence != local.sequence || d.kind != local.kind || d.datatype != local.datatype ||
@@ -858,10 +1043,11 @@ namespace nccl_fold {
             if (!need_rank) continue;
             if (rank == comm->rank) sources[rank] = const_cast<void*>(args.sendbuff);
             else if (source_bytes) {
-                cudaEvent_t event = NULL; void* base = NULL;
+                cudaEvent_t event = NULL; void* base = NULL; bool temporary = false;
                 if ((result = openEvent(comm, d.ready, &event, "cudaIpcOpenEventHandle(collective ready)")) != ncclSuccess) return result;
                 if ((result = cudaCheck(runtime.cudaStreamWaitEvent(args.stream, event, 0), "cudaStreamWaitEvent(collective ready)")) != ncclSuccess) return result;
-                if ((result = openMemory(comm, d.memory.handle, &base)) != ncclSuccess) return result;
+                if ((result = importMemory(comm, rank, d.memory, &base, &temporary)) != ncclSuccess) return result;
+                if (temporary) imported_pool_pointers.push_back(base);
                 sources[rank] = (char*)base + d.memory.offset;
             }
         }
@@ -926,6 +1112,14 @@ namespace nccl_fold {
             if (result == ncclSuccess) result = cudaCheck(free_error, "cudaFreeAsync(reduction sources)");
         }
         if (result != ncclSuccess) return result;
+
+        /* Pool imports are operation-scoped.  Queue each importing free after
+         * its final read and before the done event exported below. */
+        for (size_t i = 0; i < imported_pool_pointers.size(); ++i) {
+            result = cudaCheck(runtime.origCudaFreeAsync(imported_pool_pointers[i], args.stream),
+                               "cudaFreeAsync(imported collective pointer)");
+            if (result != ncclSuccess) return result;
+        }
 
         /* Host metadata exchange is blocking, but GPU execution remains asynchronous.
          * Done events make later work on every source stream wait until all remote
@@ -1142,6 +1336,9 @@ namespace nccl_fold {
             if (runtime.cudaEventDestroy(comm->imported_event_cache[i].event) != cudaSuccess) result = ncclUnhandledCudaError;
         for (size_t i = 0; i < comm->ipc_mappings.size(); ++i)
             if (runtime.cudaIpcCloseMemHandle(comm->ipc_mappings[i].pointer) != cudaSuccess) result = ncclUnhandledCudaError;
+        for (size_t i = 0; i < comm->imported_pools.size(); ++i)
+            if (comm->imported_pools[i] && cudaMemPoolDestroy(comm->imported_pools[i]) != cudaSuccess)
+                result = ncclUnhandledCudaError;
         for (size_t i = 0; i < comm->retained_ipc_allocations.size(); ++i)
             if (runtime.origCudaFree(comm->retained_ipc_allocations[i]) != cudaSuccess) result = ncclUnhandledCudaError;
         if (comm->mpi_comm != MPI_COMM_NULL && MPI_Comm_free(&comm->mpi_comm) != MPI_SUCCESS && result == ncclSuccess)

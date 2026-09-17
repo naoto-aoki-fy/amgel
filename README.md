@@ -13,6 +13,9 @@ as a submodule. NCCL 2.28 or newer is required to build support for the host
 headers NCCL Fold still builds, but those three unavailable symbols are not
 interposed.
 
+CUDA 11.3 or newer is required. NCCL Fold's interposed `cudaMallocAsync` uses
+the CUDA memory-pool IPC API introduced in CUDA 11.3.
+
 Define the environment-specific compiler, linker, and GPU architecture options
 in `config.mk`, which the Makefile automatically includes. For example:
 
@@ -168,7 +171,11 @@ NCCL Fold does **not** preserve the following:
 * Every nonempty referenced range is within a live allocation observed through
   the interposed `cudaMalloc` or `cudaMallocAsync`; untracked allocations
   (including CUDA driver-API, managed, host, externally imported, or custom
-  allocator memory) are unsupported. The allocation must be CUDA-IPC-exportable.
+  allocator memory) are unsupported. Legacy allocations must be CUDA-IPC-exportable.
+  Async allocations come from NCCL Fold's explicit exportable pool and require
+  Linux/POSIX-file-descriptor memory-pool IPC. Direct user calls to
+  `cudaMallocFromPoolAsync` and allocations from user-created/custom pools are
+  outside the supported communication-buffer surface.
 * Ranks issue compatible operations. Collectives occur in the same order on all
   communicator ranks; Send and Recv are balanced and ordered compatibly for each
   peer. Concurrent host threads must not race operations on the same communicator
@@ -183,15 +190,16 @@ NCCL Fold does **not** preserve the following:
 
 ### Known Semantic Deviations
 
-* **Stream-ordered allocation is changed.** Interposed `cudaMallocAsync` calls
-  synchronous `cudaMalloc`, so allocation visibility, allocation-pool behavior,
-  failure timing, and the synchronization/progress effects of allocation differ
-  from CUDA. This can hide bugs that rely incorrectly on stream-ordered
-  allocation or introduce ordering/performance behavior absent from the native
-  run. `cudaFreeAsync` remains asynchronous but NCCL Fold removes the allocation
-  from its tracking table as soon as the free is accepted, which can reject a
-  later operation even while CUDA still considers earlier stream-ordered uses
-  valid.
+* **Allocator coverage is limited.** Interposed `cudaMallocAsync` is genuinely
+  stream ordered: it calls `cudaMallocFromPoolAsync` on an NCCL Fold-owned,
+  IPC-capable explicit pool. It no longer substitutes synchronous `cudaMalloc`.
+  This resolves that synchronization deviation, but does not provide complete
+  CUDA allocator equivalence: custom/user pools, direct
+  `cudaMallocFromPoolAsync`, pool attributes, and graph capture are unsupported.
+  Devices must report memory-pool support and POSIX-FD handle support; otherwise
+  `cudaMallocAsync` returns an error with no synchronous fallback. NCCL Fold
+  removes tracking metadata when CUDA accepts `cudaFree`/`cudaFreeAsync`, so a
+  subsequently submitted communication call cannot refer to that pointer.
 * **Grouping is only a subset of NCCL grouping semantics.** Groups are
   thread-local, may nest, and defer submission until the outermost
   `ncclGroupEnd`. Submission preserves call order across P2P, collectives, and
@@ -218,11 +226,13 @@ NCCL Fold does **not** preserve the following:
   contexts or properties.
 * **Resource lifetime differs.** IPC-capable events are communicator-owned and
   pooled; imported event objects are cached by IPC handle. Reduction source
-  pointer arrays use stream-ordered allocation and free. Imported IPC memory
-  mappings remain cached until `ncclCommDestroy`, because closing a mapping
-  requires coordination with both queued remote work and the exporting
-  allocation. Grouped-send snapshots are IPC-exported allocations and are also
-  conservatively retained for that reason. Destroy does not first synchronize
+  pointer arrays use stream-ordered allocation and free. Legacy imported IPC
+  memory mappings remain cached until `ncclCommDestroy`. In contrast, imported
+  pool pointers are freed asynchronously in the consuming operation stream
+  before its done event, and the exporter waits on that event before later
+  source-stream work. Imported pool objects are communicator-owned; the local
+  export pool intentionally has process lifetime. Grouped-send snapshots are
+  legacy IPC-exported allocations and are conservatively retained. Destroy does not first synchronize
   outstanding GPU work, so destroying a communicator before its work completes
   remains unsupported.
 * **Bootstrap has stronger environmental constraints.** Communicator discovery
@@ -244,8 +254,17 @@ containing exactly the processes which initialize it with the same
 subsets and reordered ranks work without involving other `MPI_COMM_WORLD`
 processes. Each communicator has its own MPI communicator, rank, size, sequence
 counters, CUDA IPC mappings, event pools, and reduction scratch accounting. Communicators
-therefore do not share a singleton operation state. CUDA allocation metadata records both
-base and size and is removed by intercepted `cudaFree`/`cudaFreeAsync` calls.
+therefore do not share a singleton operation state. CUDA allocation metadata records
+base, size, and whether the allocation is legacy or belongs to NCCL Fold's async
+pool, and is removed by intercepted `cudaFree`/`cudaFreeAsync` calls.
+
+At communicator initialization, every rank exports its process-global pool as a
+POSIX file descriptor. The descriptors are transferred over communicator-unique
+Unix-domain sockets using `SCM_RIGHTS` (the integer descriptor values are never
+sent through MPI), imported once per communicator, and closed after import.
+Pointer export records are opaque tagged metadata carried by MPI alongside
+legacy `cudaIpcMemHandle_t` records. This permits legacy and async-pool buffers,
+including interior pointers, to participate in the same operation.
 
 For each collective, ranks record a ready event and exchange allocation IPC
 handles, offsets, operation metadata, and event handles using MPI. Broadcast
