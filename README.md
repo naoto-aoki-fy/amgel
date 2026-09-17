@@ -8,7 +8,10 @@ a performance model for a multi-GPU system.
 
 CUDA, MPI, NCCL, libelf, and `nvcc` are required. Prepare
 [`atlc`](https://github.com/naoto-aoki-fy/atlc) separately; it is not included
-as a submodule.
+as a submodule. NCCL 2.28 or newer is required to build support for the host
+`ncclAlltoAll`, `ncclGather`, and `ncclScatter` entry points. With older NCCL
+headers NCCL Fold still builds, but those three unavailable symbols are not
+interposed.
 
 Define the environment-specific compiler, linker, and GPU architecture options
 in `config.mk`, which the Makefile automatically includes. For example:
@@ -47,6 +50,9 @@ then executed across four logical ranks on physical device zero.
 | `ncclBroadcast` | Supported | Any valid root |
 | `ncclBcast` | Supported | In-place broadcast alias |
 | `ncclAllGather` | Supported | Rank-ordered output |
+| `ncclAlltoAll` | Supported (NCCL 2.28+) | Rank-ordered source blocks; in-place unsupported |
+| `ncclGather` | Supported (NCCL 2.28+) | Rank-ordered output on root; root-slot in-place supported |
+| `ncclScatter` | Supported (NCCL 2.28+) | Root's rank-ordered input blocks; root-slot in-place supported |
 | `ncclReduce` | Supported | Any valid root |
 | `ncclAllReduce` | Supported | Typed reduction kernel |
 | `ncclReduceScatter` | Supported | Rank-dependent reduced segment |
@@ -59,8 +65,12 @@ The collective datatype set is `ncclInt8`, `ncclUint8`, `ncclInt32`,
 
 Documented in-place layouts work naturally: a shared broadcast buffer,
 AllReduce with identical input/output, AllGather with the input in the calling
-rank's output slot, Reduce with identical root input/output, and ReduceScatter
-with the output pointing at the calling rank's input segment. Every referenced
+rank's output slot, Reduce with identical root input/output, ReduceScatter with
+the output pointing at the calling rank's input segment, Gather with the root's
+input at `recvbuff + root * count`, and Scatter with the root's output at
+`sendbuff + root * count` (offsets are in datatype elements). NCCL documents
+AlltoAll in-place operation as unsupported; NCCL Fold rejects equal, nonempty
+AlltoAll send and receive pointers with `ncclInvalidArgument`. Every referenced
 range must belong to a live CUDA allocation tracked by NCCL Fold.
 
 ## Semantic Contract
@@ -79,10 +89,13 @@ executions:
   and distinct logical ranks. `ncclCommCount` and `ncclCommUserRank` report that
   logical size and rank. Subsets and rank orderings need not match
   `MPI_COMM_WORLD`.
-* **Collective value semantics.** Broadcast, AllGather, Reduce, AllReduce, and
-  ReduceScatter produce the documented rank-selected or rank-ordered values for
-  the datatypes and reduction operators in the compatibility table. Reductions
-  are evaluated in increasing logical-rank order. This is mathematical/value
+* **Collective value semantics.** Broadcast, AllGather, AlltoAll, Gather,
+  Scatter, Reduce, AllReduce, and ReduceScatter produce the documented
+  rank-selected or rank-ordered values for the datatypes and reduction
+  operators in the compatibility table. Gather places rank `i` in root output
+  slot `i`; Scatter sends root input slot `i` to rank `i`; and rank `r`'s
+  AlltoAll output slot `i` receives source rank `i`'s slot `r`. Reductions are
+  evaluated in increasing logical-rank order. This is mathematical/value
   equivalence, subject to the floating-point caveat below, not byte-for-byte
   equivalence with an arbitrary native NCCL algorithm.
 * **P2P value and matching semantics.** Send/Recv transfers the requested byte
@@ -143,7 +156,9 @@ NCCL Fold does **not** preserve the following:
   initialization.
 * The supported communication surface is `ncclSend`, `ncclRecv`,
   `ncclBroadcast`, `ncclBcast`, `ncclAllGather`, `ncclReduce`, `ncclAllReduce`,
-  and `ncclReduceScatter`, with the datatypes and operators in the table above.
+  `ncclReduceScatter`, and (when built against NCCL 2.28 or newer)
+  `ncclAlltoAll`, `ncclGather`, and `ncclScatter`, with the datatypes and
+  operators in the table above.
   The interposed management/query surface is `ncclGetUniqueId`,
   `ncclCommInitRank`, `ncclCommCount`, `ncclCommUserRank`, `ncclCommDestroy`, and
   nested `ncclGroupStart`/`ncclGroupEnd`. No equivalence claim is made for
@@ -234,8 +249,11 @@ base and size and is removed by intercepted `cudaFree`/`cudaFreeAsync` calls.
 
 For each collective, ranks record a ready event and exchange allocation IPC
 handles, offsets, operation metadata, and event handles using MPI. Broadcast
-copies from the root mapping. AllGather copies each rank into its ordered output
-slot. Reduce, AllReduce, and ReduceScatter launch an explicit typed CUDA kernel
+copies from the root mapping. AllGather and Gather copy each contributing rank
+into its ordered output slot; Scatter selects the destination rank's block from
+the root mapping; and AlltoAll selects the destination rank's block from every
+source mapping and places it in source-rank order. Reduce, AllReduce, and
+ReduceScatter launch an explicit typed CUDA kernel
 over mapped rank inputs; ReduceScatter selects the local rank's segment. A
 second event exchange adds stream dependencies that prevent premature source
 reuse. GPU copies and kernels are enqueued in the user-provided stream; NCCL Fold

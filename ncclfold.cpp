@@ -78,7 +78,10 @@ namespace nccl_fold {
         cudaEvent_t event;
     };
 
-    enum CollectiveKind { Broadcast, AllGather, Reduce, AllReduce, ReduceScatter };
+    enum CollectiveKind {
+        Broadcast, AllGather, Reduce, AllReduce, ReduceScatter,
+        AlltoAll, Gather, Scatter
+    };
     struct CollectiveArgs {
         CollectiveKind kind;
         const void* sendbuff;
@@ -139,6 +142,11 @@ namespace nccl_fold {
         decltype(&::ncclReduce) origNcclReduce;
         decltype(&::ncclAllReduce) origNcclAllReduce;
         decltype(&::ncclReduceScatter) origNcclReduceScatter;
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+        decltype(&::ncclAlltoAll) origNcclAlltoAll;
+        decltype(&::ncclGather) origNcclGather;
+        decltype(&::ncclScatter) origNcclScatter;
+#endif
         decltype(&::ncclCommDestroy) origNcclCommDestroy;
         decltype(&::ncclCommCount) origNcclCommCount;
         decltype(&::ncclCommUserRank) origNcclCommUserRank;
@@ -798,21 +806,35 @@ namespace nccl_fold {
         const uint64_t element_size = sizeofNcclDataType(args.datatype);
         const bool reduction = args.kind == Reduce || args.kind == AllReduce || args.kind == ReduceScatter;
         if (!element_size || (reduction && !validReduction(args.op))) return ncclInvalidArgument;
-        if ((args.kind == Broadcast || args.kind == Reduce) && (args.root < 0 || args.root >= comm->ndev)) return ncclInvalidArgument;
-        size_t source_count = args.kind == ReduceScatter ? args.count * (size_t)comm->ndev : args.count;
-        bool produces_output = args.kind != Reduce || comm->rank == args.root;
-        bool has_source = args.kind != Broadcast || comm->rank == args.root;
+        const bool rooted = args.kind == Broadcast || args.kind == Reduce ||
+                            args.kind == Gather || args.kind == Scatter;
+        if (rooted && (args.root < 0 || args.root >= comm->ndev)) return ncclInvalidArgument;
+        const bool rank_wide_source = args.kind == ReduceScatter || args.kind == AlltoAll ||
+                                      args.kind == Scatter;
+        if (rank_wide_source && args.count > SIZE_MAX / (size_t)comm->ndev)
+            return ncclInvalidArgument;
+        size_t source_count = rank_wide_source ? args.count * (size_t)comm->ndev : args.count;
+        bool produces_output = (args.kind != Reduce && args.kind != Gather) || comm->rank == args.root;
+        bool has_source = (args.kind != Broadcast && args.kind != Scatter) || comm->rank == args.root;
         if (source_count && ((has_source && !args.sendbuff) || (produces_output && !args.recvbuff))) return ncclInvalidArgument;
         if (source_count > SIZE_MAX / element_size) return ncclInvalidArgument;
         size_t source_bytes = source_count * element_size;
+        if (args.count > SIZE_MAX / element_size) return ncclInvalidArgument;
+        size_t block_bytes = args.count * element_size;
+
+        /* NCCL explicitly does not support the equal-pointer AlltoAll in-place
+         * form.  Gather and Scatter's root-slot aliases are supported below. */
+        if (args.kind == AlltoAll && source_bytes && args.sendbuff == args.recvbuff)
+            return ncclInvalidArgument;
 
         CollectiveDescriptor local = {};
         local.bytes = source_bytes; local.sequence = comm->collective_sequence++;
         local.kind = args.kind; local.datatype = args.datatype; local.op = reduction ? args.op : 0; local.root = args.root;
         void* allocation = has_source ? getAllocation(const_cast<void*>(args.sendbuff), source_bytes, &local.memory.offset) : NULL;
         if (source_bytes && has_source && !allocation) return ncclInvalidArgument;
-        if (args.kind == AllGather && source_bytes > SIZE_MAX / (size_t)comm->ndev) return ncclInvalidArgument;
-        size_t output_bytes = args.kind == AllGather ? source_bytes * comm->ndev : args.count * element_size;
+        const bool rank_wide_output = args.kind == AllGather || args.kind == AlltoAll || args.kind == Gather;
+        if (rank_wide_output && block_bytes > SIZE_MAX / (size_t)comm->ndev) return ncclInvalidArgument;
+        size_t output_bytes = rank_wide_output ? block_bytes * comm->ndev : block_bytes;
         if (produces_output && output_bytes && !getAllocation(args.recvbuff, output_bytes, NULL)) return ncclInvalidArgument;
         if (source_bytes && has_source) {
             ncclResult_t result = cudaCheck(runtime.cudaIpcGetMemHandle(&local.memory.handle, allocation), "cudaIpcGetMemHandle(collective)");
@@ -832,7 +854,7 @@ namespace nccl_fold {
             const CollectiveDescriptor& d = descriptors[rank];
             if (d.sequence != local.sequence || d.kind != local.kind || d.datatype != local.datatype ||
                 d.op != local.op || d.root != local.root || d.bytes != local.bytes) return ncclInvalidUsage;
-            bool need_rank = args.kind != Broadcast || rank == args.root;
+            bool need_rank = (args.kind != Broadcast && args.kind != Scatter) || rank == args.root;
             if (!need_rank) continue;
             if (rank == comm->rank) sources[rank] = const_cast<void*>(args.sendbuff);
             else if (source_bytes) {
@@ -853,6 +875,26 @@ namespace nccl_fold {
             for (int rank = 0; rank < comm->ndev && result == ncclSuccess; ++rank) {
                 void* destination = (char*)args.recvbuff + rank * source_bytes;
                 if (source_bytes && destination != sources[rank]) result = cudaCheck(runtime.cudaMemcpyAsync(destination, sources[rank], source_bytes, cudaMemcpyDeviceToDevice, args.stream), "cudaMemcpyAsync(AllGather)");
+            }
+        } else if (args.kind == AlltoAll) {
+            for (int rank = 0; rank < comm->ndev && result == ncclSuccess; ++rank) {
+                if (block_bytes) {
+                    const void* source = (const char*)sources[rank] + (size_t)comm->rank * block_bytes;
+                    void* destination = (char*)args.recvbuff + (size_t)rank * block_bytes;
+                    result = cudaCheck(runtime.cudaMemcpyAsync(destination, source, block_bytes, cudaMemcpyDeviceToDevice, args.stream), "cudaMemcpyAsync(AlltoAll)");
+                }
+            }
+        } else if (args.kind == Gather) {
+            if (comm->rank == args.root) {
+                for (int rank = 0; rank < comm->ndev && result == ncclSuccess; ++rank) {
+                    void* destination = (char*)args.recvbuff + (size_t)rank * block_bytes;
+                    if (block_bytes && destination != sources[rank]) result = cudaCheck(runtime.cudaMemcpyAsync(destination, sources[rank], block_bytes, cudaMemcpyDeviceToDevice, args.stream), "cudaMemcpyAsync(Gather)");
+                }
+            }
+        } else if (args.kind == Scatter) {
+            if (block_bytes) {
+                const void* source = (const char*)sources[args.root] + (size_t)comm->rank * block_bytes;
+                if (args.recvbuff != source) result = cudaCheck(runtime.cudaMemcpyAsync(args.recvbuff, source, block_bytes, cudaMemcpyDeviceToDevice, args.stream), "cudaMemcpyAsync(Scatter)");
             }
         } else if (args.kind != Reduce || comm->rank == args.root) {
             void** device_sources = NULL;
@@ -999,6 +1041,21 @@ namespace nccl_fold {
             ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream) {
         return collective(ReduceScatter, sendbuff, recvbuff, count, datatype, op, -1, comm, stream);
     }
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    static ncclResult_t alltoAll(const void* sendbuff, void* recvbuff, size_t count,
+            ncclDataType_t datatype, ncclComm_t comm, cudaStream_t stream) {
+        return collective(AlltoAll, sendbuff, recvbuff, count, datatype, ncclSum, -1, comm, stream);
+    }
+    static ncclResult_t gather(const void* sendbuff, void* recvbuff, size_t count,
+            ncclDataType_t datatype, int root, ncclComm_t comm, cudaStream_t stream) {
+        return collective(Gather, sendbuff, recvbuff, count, datatype, ncclSum, root, comm, stream);
+    }
+    static ncclResult_t scatter(const void* sendbuff, void* recvbuff, size_t count,
+            ncclDataType_t datatype, int root, ncclComm_t comm, cudaStream_t stream) {
+        return collective(Scatter, sendbuff, recvbuff, count, datatype, ncclSum, root, comm, stream);
+    }
+#endif
 
     static ncclResult_t send(const void* sendbuff, size_t count, ncclDataType_t datatype, int peer,
                              ncclComm_t handle, cudaStream_t stream) {
@@ -1175,6 +1232,11 @@ namespace nccl_fold {
         ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclReduce, (gpointer)nccl_fold::reduce, NULL, (gpointer*)&runtime.origNcclReduce);
         ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclAllReduce, (gpointer)nccl_fold::allReduce, NULL, (gpointer*)&runtime.origNcclAllReduce);
         ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclReduceScatter, (gpointer)nccl_fold::reduceScatter, NULL, (gpointer*)&runtime.origNcclReduceScatter);
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclAlltoAll, (gpointer)nccl_fold::alltoAll, NULL, (gpointer*)&runtime.origNcclAlltoAll);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclGather, (gpointer)nccl_fold::gather, NULL, (gpointer*)&runtime.origNcclGather);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclScatter, (gpointer)nccl_fold::scatter, NULL, (gpointer*)&runtime.origNcclScatter);
+#endif
 
         ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclCommDestroy, (gpointer)nccl_fold::commDestroy, NULL, (gpointer*)&runtime.origNcclCommDestroy);
 
