@@ -32,7 +32,7 @@
 #include <atlc/check_cuda.hpp>
 #include <atlc/check_frida.hpp>
 
-namespace amgel {
+namespace nccl_fold {
 
     static GumInterceptor *interceptor = NULL;
 
@@ -80,7 +80,7 @@ namespace amgel {
     };
 
     struct VirtualComm {
-        static constexpr uint64_t MAGIC = UINT64_C(0x414d47454c434f4d);
+        static constexpr uint64_t MAGIC = UINT64_C(0x4e43434c464f4c44);
         uint64_t magic;
         ncclUniqueId unique_id;
         std::vector<cudaEvent_t> owned_events;
@@ -227,7 +227,7 @@ namespace amgel {
     }
 
     /* ncclCommInitRank has no MPI communicator argument, so membership has to
-     * be bootstrapped out of band.  AMGeL is single-host: small, atomically
+     * be bootstrapped out of band.  NCCL Fold is single-host: small, atomically
      * published files let only the participating processes rendezvous without
      * involving non-members in an MPI_COMM_WORLD collective. */
     struct BootstrapRecord {
@@ -302,8 +302,8 @@ namespace amgel {
             MPI_Comm_size(MPI_COMM_WORLD, &world_size) != MPI_SUCCESS || ndev > world_size)
             return ncclInvalidArgument;
 
-        const char* configured = std::getenv("AMGEL_BOOTSTRAP_DIR");
-        std::string root = configured && *configured ? configured : "/tmp/amgel-bootstrap-" + std::to_string((long long)getuid());
+        const char* configured = std::getenv("NCCL_FOLD_BOOTSTRAP_DIR");
+        std::string root = configured && *configured ? configured : "/tmp/nccl-fold-bootstrap-" + std::to_string((long long)getuid());
         if (!makeDirectory(root)) return ncclSystemError;
         uint64_t h1 = hashId(id, UINT64_C(1469598103934665603));
         uint64_t h2 = hashId(id, UINT64_C(7809847782465536322));
@@ -432,19 +432,19 @@ namespace amgel {
     }
 
     static bool debugEnabled() {
-        static int enabled = std::getenv("AMGEL_DEBUG_P2P") != NULL;
+        static int enabled = std::getenv("NCCL_FOLD_DEBUG_P2P") != NULL;
         return enabled != 0;
     }
 
     static ncclResult_t cudaCheck(cudaError_t error, const char* operation) {
         if (error == cudaSuccess) return ncclSuccess;
-        std::fprintf(stderr, "AMGeL: %s failed: %s\n", operation, cudaGetErrorString(error));
+        std::fprintf(stderr, "NCCL Fold: %s failed: %s\n", operation, cudaGetErrorString(error));
         return ncclUnhandledCudaError;
     }
 
     static ncclResult_t mpiCheck(int error, const char* operation) {
         if (error == MPI_SUCCESS) return ncclSuccess;
-        std::fprintf(stderr, "AMGeL: %s failed with MPI error %d\n", operation, error);
+        std::fprintf(stderr, "NCCL Fold: %s failed with MPI error %d\n", operation, error);
         return ncclSystemError;
     }
 
@@ -497,7 +497,7 @@ namespace amgel {
             if (result != ncclSuccess) return result;
             message.bytes = op.count * type_size;
             message.sequence = op.sequence;
-            if (debugEnabled()) std::fprintf(stderr, "AMGeL comm=%p rank=%d peer=%d seq=%llu ready=%p stream=%p send\n",
+            if (debugEnabled()) std::fprintf(stderr, "NCCL Fold comm=%p rank=%d peer=%d seq=%llu ready=%p stream=%p send\n",
                 (void*)comm, comm->rank, op.peer, (unsigned long long)op.sequence, (void*)ready, (void*)op.stream);
         }
         for (size_t i = 0; i < send_count; ++i) {
@@ -548,7 +548,7 @@ namespace amgel {
             result = cudaCheck(runtime.cudaIpcGetEventHandle(&outgoing_done[i].done, done), "runtime.cudaIpcGetEventHandle(done)");
             if (result != ncclSuccess) return result;
             outgoing_done[i].sequence = message.sequence;
-            if (debugEnabled()) std::fprintf(stderr, "AMGeL comm=%p rank=%d peer=%d seq=%llu done=%p stream=%p recv\n",
+            if (debugEnabled()) std::fprintf(stderr, "NCCL Fold comm=%p rank=%d peer=%d seq=%llu done=%p stream=%p recv\n",
                 (void*)comm, comm->rank, op.peer, (unsigned long long)message.sequence, (void*)done, (void*)op.stream);
         }
         for (size_t i = 0; i < recv_count; ++i) {
@@ -926,40 +926,40 @@ namespace amgel {
         runtime.cudaIpcOpenEventHandle = &::cudaIpcOpenEventHandle;
         runtime.cudaStreamWaitEvent = &::cudaStreamWaitEvent;
 
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)find_symbol_offset_or_dlsym("/proc/self/exe", "cudaMalloc"), (gpointer)amgel::cudaMalloc, NULL, (gpointer*)&runtime.origCudaMalloc);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)find_symbol_offset_or_dlsym("/proc/self/exe", "cudaMalloc"), (gpointer)nccl_fold::cudaMalloc, NULL, (gpointer*)&runtime.origCudaMalloc);
 
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)find_symbol_offset_or_dlsym("/proc/self/exe", "cudaMallocAsync"), (gpointer)amgel::cudaMallocAsync, NULL, (gpointer*)&runtime.origCudaMallocAsync);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)find_symbol_offset_or_dlsym("/proc/self/exe", "cudaMallocAsync"), (gpointer)nccl_fold::cudaMallocAsync, NULL, (gpointer*)&runtime.origCudaMallocAsync);
 
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)find_symbol_offset_or_dlsym("/proc/self/exe", "cudaFree"), (gpointer)amgel::cudaFree, NULL, (gpointer*)&runtime.origCudaFree);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)find_symbol_offset_or_dlsym("/proc/self/exe", "cudaFree"), (gpointer)nccl_fold::cudaFree, NULL, (gpointer*)&runtime.origCudaFree);
 
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)find_symbol_offset_or_dlsym("/proc/self/exe", "cudaFreeAsync"), (gpointer)amgel::cudaFreeAsync, NULL, (gpointer*)&runtime.origCudaFreeAsync);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)find_symbol_offset_or_dlsym("/proc/self/exe", "cudaFreeAsync"), (gpointer)nccl_fold::cudaFreeAsync, NULL, (gpointer*)&runtime.origCudaFreeAsync);
 
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)find_symbol_offset_or_dlsym("/proc/self/exe", "cudaSetDevice"), (gpointer)amgel::cudaSetDevice, NULL, (gpointer*)&runtime.origCudaSetDevice);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)find_symbol_offset_or_dlsym("/proc/self/exe", "cudaSetDevice"), (gpointer)nccl_fold::cudaSetDevice, NULL, (gpointer*)&runtime.origCudaSetDevice);
 
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclGetUniqueId, (gpointer)amgel::getUniqueId, NULL, (gpointer*)&runtime.origNcclGetUniqueId);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclGetUniqueId, (gpointer)nccl_fold::getUniqueId, NULL, (gpointer*)&runtime.origNcclGetUniqueId);
 
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclCommInitRank, (gpointer)amgel::commInitRank, NULL, (gpointer*)&runtime.origNcclCommInitRank);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclCommInitRank, (gpointer)nccl_fold::commInitRank, NULL, (gpointer*)&runtime.origNcclCommInitRank);
 
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclGroupStart, (gpointer)amgel::groupStart, NULL, (gpointer*)&runtime.origNcclGroupStart);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclGroupStart, (gpointer)nccl_fold::groupStart, NULL, (gpointer*)&runtime.origNcclGroupStart);
 
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclGroupEnd, (gpointer)amgel::groupEnd, NULL, (gpointer*)&runtime.origNcclGroupEnd);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclGroupEnd, (gpointer)nccl_fold::groupEnd, NULL, (gpointer*)&runtime.origNcclGroupEnd);
 
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclSend, (gpointer)amgel::send, NULL, (gpointer*)&runtime.origNcclSend);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclSend, (gpointer)nccl_fold::send, NULL, (gpointer*)&runtime.origNcclSend);
 
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclRecv, (gpointer)amgel::recv, NULL, (gpointer*)&runtime.origNcclRecv);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclRecv, (gpointer)nccl_fold::recv, NULL, (gpointer*)&runtime.origNcclRecv);
 
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclBroadcast, (gpointer)amgel::broadcast, NULL, (gpointer*)&runtime.origNcclBroadcast);
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclBcast, (gpointer)amgel::bcast, NULL, (gpointer*)&runtime.origNcclBcast);
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclAllGather, (gpointer)amgel::allGather, NULL, (gpointer*)&runtime.origNcclAllGather);
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclReduce, (gpointer)amgel::reduce, NULL, (gpointer*)&runtime.origNcclReduce);
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclAllReduce, (gpointer)amgel::allReduce, NULL, (gpointer*)&runtime.origNcclAllReduce);
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclReduceScatter, (gpointer)amgel::reduceScatter, NULL, (gpointer*)&runtime.origNcclReduceScatter);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclBroadcast, (gpointer)nccl_fold::broadcast, NULL, (gpointer*)&runtime.origNcclBroadcast);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclBcast, (gpointer)nccl_fold::bcast, NULL, (gpointer*)&runtime.origNcclBcast);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclAllGather, (gpointer)nccl_fold::allGather, NULL, (gpointer*)&runtime.origNcclAllGather);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclReduce, (gpointer)nccl_fold::reduce, NULL, (gpointer*)&runtime.origNcclReduce);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclAllReduce, (gpointer)nccl_fold::allReduce, NULL, (gpointer*)&runtime.origNcclAllReduce);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclReduceScatter, (gpointer)nccl_fold::reduceScatter, NULL, (gpointer*)&runtime.origNcclReduceScatter);
 
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclCommDestroy, (gpointer)amgel::commDestroy, NULL, (gpointer*)&runtime.origNcclCommDestroy);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclCommDestroy, (gpointer)nccl_fold::commDestroy, NULL, (gpointer*)&runtime.origNcclCommDestroy);
 
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclCommCount, (gpointer)amgel::commCount, NULL, (gpointer*)&runtime.origNcclCommCount);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclCommCount, (gpointer)nccl_fold::commCount, NULL, (gpointer*)&runtime.origNcclCommCount);
 
-        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, amgel::interceptor, (gpointer)ncclCommUserRank, (gpointer)amgel::commUserRank, NULL, (gpointer*)&runtime.origNcclCommUserRank);
+        ATLC_CHECK_FRIDA_GUM_REPLACE(gum_interceptor_replace, nccl_fold::interceptor, (gpointer)ncclCommUserRank, (gpointer)nccl_fold::commUserRank, NULL, (gpointer*)&runtime.origNcclCommUserRank);
 
         gum_interceptor_end_transaction(interceptor);
     }

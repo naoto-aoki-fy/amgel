@@ -1,6 +1,6 @@
-# A's Multi-GPUs Emulation Layer (AMGeL)
+# NCCL Fold
 
-AMGeL runs CUDA/MPI/NCCL programs written for one GPU per MPI process on a
+NCCL Fold runs CUDA/MPI/NCCL programs written for one GPU per MPI process on a
 single physical NVIDIA GPU. It is a correctness-oriented emulation layer, not
 a performance model for a multi-GPU system.
 
@@ -20,7 +20,7 @@ GENCODE_FLAGS = -gencode=arch=compute_xx,code=sm_xx
 ```
 
 The `atlc/include` path may instead be supplied through `CPATH`. Once the
-required include and library paths are configured, build AMGeL with:
+required include and library paths are configured, build NCCL Fold with:
 
 ```sh
 make
@@ -31,7 +31,7 @@ The first build downloads and extracts the configured Frida development kits.
 Run an MPI/NCCL application with the interposer preloaded, for example:
 
 ```sh
-mpirun -n 4 env LD_PRELOAD="$PWD/amgel.so" ./all_reduce_example
+mpirun -n 4 env LD_PRELOAD="$PWD/nccl-fold.so" ./all_reduce_example
 ```
 
 An ordinary call such as
@@ -55,13 +55,13 @@ The collective datatype set is `ncclInt8`, `ncclUint8`, `ncclInt32`,
 `ncclUint32`, `ncclInt64`, `ncclUint64`, `ncclFloat16`, `ncclFloat32`,
 `ncclFloat64`, and `ncclBfloat16`. Reduction collectives support `ncclSum`,
 `ncclProd`, `ncclMin`, and `ncclMax`. Other datatypes and operators return
-`ncclInvalidArgument`; AMGeL does not silently execute an approximate fallback.
+`ncclInvalidArgument`; NCCL Fold does not silently execute an approximate fallback.
 
 Documented in-place layouts work naturally: a shared broadcast buffer,
 AllReduce with identical input/output, AllGather with the input in the calling
 rank's output slot, Reduce with identical root input/output, and ReduceScatter
 with the output pointing at the calling rank's input segment. Every referenced
-range must belong to a live CUDA allocation tracked by AMGeL.
+range must belong to a live CUDA allocation tracked by NCCL Fold.
 
 ## Implementation and stream semantics
 
@@ -80,7 +80,7 @@ copies from the root mapping. AllGather copies each rank into its ordered output
 slot. Reduce, AllReduce, and ReduceScatter launch an explicit typed CUDA kernel
 over mapped rank inputs; ReduceScatter selects the local rank's segment. A
 second event exchange adds stream dependencies that prevent premature source
-reuse. GPU copies and kernels are enqueued in the user-provided stream; AMGeL
+reuse. GPU copies and kernels are enqueued in the user-provided stream; NCCL Fold
 does **not** call `cudaStreamSynchronize` or synchronize the device.
 
 There is one important difference from native NCCL asynchronous behavior: the
@@ -90,17 +90,17 @@ queued grouped operations. GPU completion remains asynchronous after the API
 returns. Groups may include existing P2P operations, and queues remain separated
 by communicator.
 
-P2P uses the same ready/copy/done dependency scheme. Set `AMGEL_DEBUG_P2P=1`
+P2P uses the same ready/copy/done dependency scheme. Set `NCCL_FOLD_DEBUG_P2P=1`
 to log communicator, rank, peer, sequence, event, stream, and direction.
 
 ### Known limitations
 
 * Communicator discovery uses a single-host filesystem rendezvous (in
-  `/tmp/amgel-bootstrap-<uid>` by default, or `AMGEL_BOOTSTRAP_DIR`). All
+  `/tmp/nccl-fold-bootstrap-<uid>` by default, or `NCCL_FOLD_BOOTSTRAP_DIR`). All
   requested ranks must initialize with the same unique ID, size, and distinct
   NCCL ranks. Normal completion removes rendezvous files; an abnormally killed
   job can leave stale files that may be removed manually.
-* MPI provides host-side control-plane progress, so AMGeL does not reproduce
+* MPI provides host-side control-plane progress, so NCCL Fold does not reproduce
   NCCL's nonblocking host progress, algorithms, topology, or performance.
 * IPC mappings, events, and reduction pointer arrays are retained until
   `ncclCommDestroy`, favoring safe asynchronous lifetime over bounded scratch

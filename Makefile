@@ -22,10 +22,10 @@ FRIDA_CORE_SO = $(FRIDA_DIR)/so/libfrida-core.so
 FRIDA_GUM_SO = $(FRIDA_DIR)/so/libfrida-gum.so
 
 .PHONY: target
-target: amgel.so
+target: nccl-fold.so
 
-amgel.so: amgel_dynamic.so
-	ln -sf $(CURDIR)/$< amgel.so
+nccl-fold.so: nccl-fold_dynamic.so
+	ln -sf $(CURDIR)/$< nccl-fold.so
 
 $(FRIDA_CORE_A): $(FRIDA_CORE_TARXZ)
 	mkdir -p frida
@@ -57,14 +57,14 @@ $(FRIDA_GUM_SO): $(FRIDA_GUM_A)
 	ar x $(FRIDA_GUM_A) --output $(FRIDA_DIR)/libfrida-gum-o
 	cd $(FRIDA_DIR)/libfrida-gum-o && g++ -shared -fPIC *.o .*.o -o ../../$(FRIDA_SO)/libfrida-gum.so
 
-amgel_static.so: amgel.cpp $(FRIDA_CORE_A) $(FRIDA_GUM_A)
-	$(NVCC) $(NVCC_CFLAGS) -shared -I$(FRIDA_DIR) ./amgel.cpp $(NVCC_LDFLAGS) -L$(FRIDA_DIR) -lfrida-core $(LDLIBS) -o amgel_static.so
-	ln -sf $(CURDIR)/amgel_static.so amgel.so
+nccl-fold_static.so: nccl-fold.cpp $(FRIDA_CORE_A) $(FRIDA_GUM_A)
+	$(NVCC) $(NVCC_CFLAGS) -shared -I$(FRIDA_DIR) ./nccl-fold.cpp $(NVCC_LDFLAGS) -L$(FRIDA_DIR) -lfrida-core $(LDLIBS) -o nccl-fold_static.so
+	ln -sf $(CURDIR)/nccl-fold_static.so nccl-fold.so
 
-amgel_dynamic.so: amgel.cpp $(FRIDA_CORE_SO) $(FRIDA_GUM_SO)
-	$(NVCC) $(NVCC_CFLAGS) -shared -I$(FRIDA_DIR) ./amgel.cpp $(NVCC_LDFLAGS) -L$(FRIDA_SO) -Xlinker -rpath,$(CURDIR)/$(FRIDA_SO) -lfrida-core $(LDLIBS) -o amgel_dynamic.so
-	ln -sf $(CURDIR)/amgel_dynamic.so amgel.so
+nccl-fold_dynamic.so: nccl-fold.cpp $(FRIDA_CORE_SO) $(FRIDA_GUM_SO)
+	$(NVCC) $(NVCC_CFLAGS) -shared -I$(FRIDA_DIR) ./nccl-fold.cpp $(NVCC_LDFLAGS) -L$(FRIDA_SO) -Xlinker -rpath,$(CURDIR)/$(FRIDA_SO) -lfrida-core $(LDLIBS) -o nccl-fold_dynamic.so
+	ln -sf $(CURDIR)/nccl-fold_dynamic.so nccl-fold.so
 
 .PHONY: clean
 clean:
-	$(RM) amgel.so amgel_dynamic.so amgel_static.so
+	$(RM) nccl-fold.so nccl-fold_dynamic.so nccl-fold_static.so
