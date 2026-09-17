@@ -815,16 +815,12 @@ namespace nccl_fold {
         return enabled != 0;
     }
 
-    static ncclResult_t cudaCheck(cudaError_t error, const char* operation) {
-        if (error == cudaSuccess) return ncclSuccess;
-        std::fprintf(stderr, "NCCL Fold: %s failed: %s\n", operation, cudaGetErrorString(error));
-        return ncclUnhandledCudaError;
+    static ncclResult_t cudaToNccl(cudaError_t error) noexcept {
+        return error == cudaSuccess ? ncclSuccess : ncclUnhandledCudaError;
     }
 
-    static ncclResult_t mpiCheck(int error, const char* operation) {
-        if (error == MPI_SUCCESS) return ncclSuccess;
-        std::fprintf(stderr, "NCCL Fold: %s failed with MPI error %d\n", operation, error);
-        return ncclSystemError;
+    static ncclResult_t mpiToNccl(int error) noexcept {
+        return error == MPI_SUCCESS ? ncclSuccess : ncclSystemError;
     }
 
     static bool resourceStatsEnabled() {
@@ -845,8 +841,7 @@ namespace nccl_fold {
             }
         }
         cudaEvent_t created = NULL;
-        ncclResult_t result = cudaCheck(runtime.cudaEventCreateWithFlags(
-            &created, cudaEventInterprocess | cudaEventDisableTiming), "cudaEventCreateWithFlags(pool)");
+        ncclResult_t result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaEventCreateWithFlags, &created, cudaEventInterprocess | cudaEventDisableTiming));
         if (result != ncclSuccess) return result;
         comm->event_pool.push_back(EventSlot(created));
         comm->event_pool_peak = std::max(comm->event_pool_peak, comm->event_pool.size());
@@ -859,14 +854,14 @@ namespace nccl_fold {
     }
 
     static ncclResult_t openEvent(VirtualComm* comm, cudaIpcEventHandle_t const& handle,
-                                  cudaEvent_t* event, const char* operation) {
+                                  cudaEvent_t* event) {
         for (size_t i = 0; i < comm->imported_event_cache.size(); ++i) {
             if (std::memcmp(&comm->imported_event_cache[i].handle, &handle, sizeof(handle)) == 0) {
                 *event = comm->imported_event_cache[i].event;
                 return ncclSuccess;
             }
         }
-        ncclResult_t result = cudaCheck(runtime.cudaIpcOpenEventHandle(event, handle), operation);
+        ncclResult_t result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaIpcOpenEventHandle, event, handle));
         if (result == ncclSuccess) comm->imported_event_cache.push_back({handle, *event});
         return result;
     }
@@ -877,9 +872,9 @@ namespace nccl_fold {
                                      memoryDescriptor* descriptor, uint64_t offset) {
         descriptor->kind = kind; descriptor->reserved = 0; descriptor->offset = offset;
         cudaError_t error = kind == LegacyAllocation
-            ? runtime.cudaIpcGetMemHandle(&descriptor->handle.legacy, allocation)
-            : cudaMemPoolExportPointer(&descriptor->handle.pool, allocation);
-        return cudaCheck(error, kind == LegacyAllocation ? "cudaIpcGetMemHandle" : "cudaMemPoolExportPointer");
+            ? ATLC_LOG_CUDA(runtime.cudaIpcGetMemHandle, &descriptor->handle.legacy, allocation)
+            : ATLC_LOG_CUDA(cudaMemPoolExportPointer, &descriptor->handle.pool, allocation);
+        return cudaToNccl(error);
     }
 
     static ncclResult_t openMemory(VirtualComm* comm, cudaIpcMemHandle_t const& handle, void** pointer) {
@@ -889,7 +884,7 @@ namespace nccl_fold {
                 return ncclSuccess;
             }
         }
-        ncclResult_t result = cudaCheck(runtime.cudaIpcOpenMemHandle(pointer, handle, cudaIpcMemLazyEnablePeerAccess), "cudaIpcOpenMemHandle");
+        ncclResult_t result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaIpcOpenMemHandle, pointer, handle, cudaIpcMemLazyEnablePeerAccess));
         if (result == ncclSuccess) comm->ipc_mappings.push_back({handle, *pointer});
         return result;
     }
@@ -901,8 +896,8 @@ namespace nccl_fold {
             return openMemory(comm, descriptor.handle.legacy, pointer);
         if (descriptor.kind != PoolAllocation || exporter < 0 || exporter >= comm->ndev ||
             !comm->imported_pools[exporter]) return ncclInvalidArgument;
-        ncclResult_t result = cudaCheck(cudaMemPoolImportPointer(pointer,
-            comm->imported_pools[exporter], &descriptor.handle.pool), "cudaMemPoolImportPointer");
+        ncclResult_t result = cudaToNccl(ATLC_LOG_CUDA(cudaMemPoolImportPointer, pointer,
+            comm->imported_pools[exporter], &descriptor.handle.pool));
         if (result == ncclSuccess) *temporary = true;
         return result;
     }
@@ -934,9 +929,9 @@ namespace nccl_fold {
             cudaEvent_t ready = NULL;
             result = leaseEvent(comm, &ready_slots[i], &ready);
             if (result != ncclSuccess) return result;
-            result = cudaCheck(runtime.cudaEventRecord(ready, op.stream), "runtime.cudaEventRecord(ready)");
+            result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaEventRecord, ready, op.stream));
             if (result != ncclSuccess) return result;
-            result = cudaCheck(runtime.cudaIpcGetEventHandle(&message.ready, ready), "runtime.cudaIpcGetEventHandle(ready)");
+            result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaIpcGetEventHandle, &message.ready, ready));
             if (result != ncclSuccess) return result;
             message.bytes = op.count * type_size;
             message.count = op.count;
@@ -946,13 +941,13 @@ namespace nccl_fold {
                 (void*)comm, comm->rank, op.peer, (unsigned long long)op.sequence, (void*)ready, (void*)op.stream);
         }
         for (size_t i = 0; i < send_count; ++i) {
-            ncclResult_t result = mpiCheck(MPI_Isend(&outgoing[i], sizeof(readyMessage), MPI_BYTE,
-                send_args[i].peer, readyTag, comm->mpi_comm, &requests[i]), "MPI_Isend(ready)");
+            ncclResult_t result = mpiToNccl(ATLC_LOG_MPI(MPI_Isend, &outgoing[i], sizeof(readyMessage), MPI_BYTE,
+                send_args[i].peer, readyTag, comm->mpi_comm, &requests[i]));
             if (result != ncclSuccess) return result;
         }
         for (size_t i = 0; i < recv_count; ++i) {
-            ncclResult_t result = mpiCheck(MPI_Irecv(&incoming[i], sizeof(incoming[i]), MPI_BYTE,
-                recv_args[i].peer, readyTag, comm->mpi_comm, &requests[send_count + i]), "MPI_Irecv(ready)");
+            ncclResult_t result = mpiToNccl(ATLC_LOG_MPI(MPI_Irecv, &incoming[i], sizeof(incoming[i]), MPI_BYTE,
+                recv_args[i].peer, readyTag, comm->mpi_comm, &requests[send_count + i]));
             if (result != ncclSuccess) return result;
         }
         if (!requests.empty()) {
@@ -992,26 +987,26 @@ namespace nccl_fold {
             cudaEvent_t done = NULL;
             void* source = NULL;
             bool temporary_source = false;
-            ncclResult_t result = openEvent(comm, message.ready, &ready, "cudaIpcOpenEventHandle(ready)");
+            ncclResult_t result = openEvent(comm, message.ready, &ready);
             if (result != ncclSuccess) return result;
             result = importMemory(comm, op.peer, message.memory, &source, &temporary_source);
             if (result != ncclSuccess) return result;
-            result = cudaCheck(runtime.cudaStreamWaitEvent(op.stream, ready, 0), "runtime.cudaStreamWaitEvent(ready)");
+            result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaStreamWaitEvent, op.stream, ready, 0));
             if (result != ncclSuccess) return result;
             if (!mismatch && message.bytes == recv_bytes) {
-                result = cudaCheck(runtime.cudaMemcpyAsync(op.buff, (char*)source + message.memory.offset, recv_bytes,
-                    cudaMemcpyDeviceToDevice, op.stream), "runtime.cudaMemcpyAsync(P2P)");
+                result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaMemcpyAsync, op.buff, (char*)source + message.memory.offset, recv_bytes,
+                    cudaMemcpyDeviceToDevice, op.stream));
                 if (result != ncclSuccess) return result;
             }
             if (temporary_source) {
-                result = cudaCheck(runtime.origCudaFreeAsync(source, op.stream), "cudaFreeAsync(imported P2P pointer)");
+                result = cudaToNccl(ATLC_LOG_CUDA(runtime.origCudaFreeAsync, source, op.stream));
                 if (result != ncclSuccess) return result;
             }
             result = leaseEvent(comm, &done_slots[i], &done);
             if (result != ncclSuccess) return result;
-            result = cudaCheck(runtime.cudaEventRecord(done, op.stream), "runtime.cudaEventRecord(done)");
+            result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaEventRecord, done, op.stream));
             if (result != ncclSuccess) return result;
-            result = cudaCheck(runtime.cudaIpcGetEventHandle(&outgoing_done[i].done, done), "runtime.cudaIpcGetEventHandle(done)");
+            result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaIpcGetEventHandle, &outgoing_done[i].done, done));
             if (result != ncclSuccess) return result;
             outgoing_done[i].sequence = message.sequence;
             outgoing_done[i].count = op.count;
@@ -1021,13 +1016,13 @@ namespace nccl_fold {
                 (void*)comm, comm->rank, op.peer, (unsigned long long)message.sequence, (void*)done, (void*)op.stream);
         }
         for (size_t i = 0; i < recv_count; ++i) {
-            ncclResult_t result = mpiCheck(MPI_Isend(&outgoing_done[i], sizeof(doneMessage), MPI_BYTE,
-                recv_args[i].peer, doneTag, comm->mpi_comm, &requests[send_count + i]), "MPI_Isend(done)");
+            ncclResult_t result = mpiToNccl(ATLC_LOG_MPI(MPI_Isend, &outgoing_done[i], sizeof(doneMessage), MPI_BYTE,
+                recv_args[i].peer, doneTag, comm->mpi_comm, &requests[send_count + i]));
             if (result != ncclSuccess) return result;
         }
         for (size_t i = 0; i < send_count; ++i) {
-            ncclResult_t result = mpiCheck(MPI_Irecv(&incoming_done[i], sizeof(doneMessage), MPI_BYTE,
-                send_args[i].peer, doneTag, comm->mpi_comm, &requests[i]), "MPI_Irecv(done)");
+            ncclResult_t result = mpiToNccl(ATLC_LOG_MPI(MPI_Irecv, &incoming_done[i], sizeof(doneMessage), MPI_BYTE,
+                send_args[i].peer, doneTag, comm->mpi_comm, &requests[i]));
             if (result != ncclSuccess) return result;
         }
         if (!requests.empty()) {
@@ -1044,23 +1039,23 @@ namespace nccl_fold {
                 incoming_done[i].datatype != send_args[i].datatype || incoming_done[i].status != ncclSuccess)
                 deferred_error = ncclInvalidUsage;
             cudaEvent_t done = NULL;
-            ncclResult_t result = openEvent(comm, incoming_done[i].done, &done, "cudaIpcOpenEventHandle(done)");
+            ncclResult_t result = openEvent(comm, incoming_done[i].done, &done);
             if (result != ncclSuccess) return result;
-            result = cudaCheck(runtime.cudaStreamWaitEvent(send_args[i].stream, done, 0), "runtime.cudaStreamWaitEvent(done)");
+            result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaStreamWaitEvent, send_args[i].stream, done, 0));
             if (result != ncclSuccess) return result;
         }
         /* Acknowledgements are sent only after all local waits above have been
          * submitted.  Receivers may then safely re-record their done slots. */
         requests.assign(send_count + recv_count, MPI_REQUEST_NULL);
         for (size_t i = 0; i < send_count; ++i) {
-            ncclResult_t result = mpiCheck(MPI_Isend(&send_args[i].sequence, 1, MPI_UINT64_T,
-                send_args[i].peer, ackTag, comm->mpi_comm, &requests[i]), "MPI_Isend(done ack)");
+            ncclResult_t result = mpiToNccl(ATLC_LOG_MPI(MPI_Isend, &send_args[i].sequence, 1, MPI_UINT64_T,
+                send_args[i].peer, ackTag, comm->mpi_comm, &requests[i]));
             if (result != ncclSuccess) return result;
         }
         std::vector<uint64_t> acknowledgements(recv_count);
         for (size_t i = 0; i < recv_count; ++i) {
-            ncclResult_t result = mpiCheck(MPI_Irecv(&acknowledgements[i], 1, MPI_UINT64_T,
-                recv_args[i].peer, ackTag, comm->mpi_comm, &requests[send_count + i]), "MPI_Irecv(done ack)");
+            ncclResult_t result = mpiToNccl(ATLC_LOG_MPI(MPI_Irecv, &acknowledgements[i], 1, MPI_UINT64_T,
+                recv_args[i].peer, ackTag, comm->mpi_comm, &requests[send_count + i]));
             if (result != ncclSuccess) return result;
         }
         if (!requests.empty()) {
@@ -1109,27 +1104,27 @@ namespace nccl_fold {
             if (grouped.kind == GroupSend) {
                 if (getAllocation(op.buff, bytes, NULL) == NULL) return ncclInvalidArgument;
                 if (bytes) {
-                    if ((result = cudaCheck(runtime.origCudaMalloc(&p.send_snapshot, bytes), "cudaMalloc(group send snapshot)")) != ncclSuccess) return result;
+                    if ((result = cudaToNccl(ATLC_LOG_CUDA(runtime.origCudaMalloc, &p.send_snapshot, bytes))) != ncclSuccess) return result;
                     grouped.comm->retained_ipc_allocations.push_back(p.send_snapshot);
                     if ((result = exportMemory(p.send_snapshot, LegacyAllocation, &p.ready.memory, 0)) != ncclSuccess) return result;
                 }
                 if ((result = leaseEvent(grouped.comm, &p.event_slot, &p.local_event)) != ncclSuccess) return result;
-                if ((result = cudaCheck(runtime.cudaIpcGetEventHandle(&p.ready.ready, p.local_event), "cudaIpcGetEventHandle(group send ready)")) != ncclSuccess) return result;
+                if ((result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaIpcGetEventHandle, &p.ready.ready, p.local_event))) != ncclSuccess) return result;
                 p.ready.bytes = bytes; p.ready.count = op.count; p.ready.sequence = op.sequence;
                 p.ready.datatype = op.datatype;
-                if ((result = mpiCheck(MPI_Isend(&p.ready, sizeof(p.ready), MPI_BYTE, op.peer, readyTag, grouped.comm->mpi_comm, &request), "MPI_Isend(group ready)")) != ncclSuccess) return result;
+                if ((result = mpiToNccl(ATLC_LOG_MPI(MPI_Isend, &p.ready, sizeof(p.ready), MPI_BYTE, op.peer, readyTag, grouped.comm->mpi_comm, &request))) != ncclSuccess) return result;
                 requests.push_back(request);
-                if ((result = mpiCheck(MPI_Irecv(&p.done, sizeof(p.done), MPI_BYTE, op.peer, doneTag, grouped.comm->mpi_comm, &request), "MPI_Irecv(group done)")) != ncclSuccess) return result;
+                if ((result = mpiToNccl(ATLC_LOG_MPI(MPI_Irecv, &p.done, sizeof(p.done), MPI_BYTE, op.peer, doneTag, grouped.comm->mpi_comm, &request))) != ncclSuccess) return result;
                 requests.push_back(request);
             } else {
                 if (bytes && getAllocation(op.buff, bytes, NULL) == NULL) return ncclInvalidArgument;
                 if ((result = leaseEvent(grouped.comm, &p.event_slot, &p.local_event)) != ncclSuccess) return result;
-                if ((result = cudaCheck(runtime.cudaIpcGetEventHandle(&p.done.done, p.local_event), "cudaIpcGetEventHandle(group recv done)")) != ncclSuccess) return result;
+                if ((result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaIpcGetEventHandle, &p.done.done, p.local_event))) != ncclSuccess) return result;
                 p.done.sequence = op.sequence; p.done.count = op.count; p.done.datatype = op.datatype;
                 p.done.status = ncclSuccess;
-                if ((result = mpiCheck(MPI_Irecv(&p.ready, sizeof(p.ready), MPI_BYTE, op.peer, readyTag, grouped.comm->mpi_comm, &request), "MPI_Irecv(group ready)")) != ncclSuccess) return result;
+                if ((result = mpiToNccl(ATLC_LOG_MPI(MPI_Irecv, &p.ready, sizeof(p.ready), MPI_BYTE, op.peer, readyTag, grouped.comm->mpi_comm, &request))) != ncclSuccess) return result;
                 requests.push_back(request);
-                if ((result = mpiCheck(MPI_Isend(&p.done, sizeof(p.done), MPI_BYTE, op.peer, doneTag, grouped.comm->mpi_comm, &request), "MPI_Isend(group done)")) != ncclSuccess) return result;
+                if ((result = mpiToNccl(ATLC_LOG_MPI(MPI_Isend, &p.done, sizeof(p.done), MPI_BYTE, op.peer, doneTag, grouped.comm->mpi_comm, &request))) != ncclSuccess) return result;
                 requests.push_back(request);
             }
         }
@@ -1154,8 +1149,8 @@ namespace nccl_fold {
                 return ncclInvalidUsage;
             }
             uint64_t const bytes = op.count * sizeofNcclDataType(op.datatype);
-            if (bytes && (result = cudaCheck(runtime.cudaMemcpyAsync(p.send_snapshot, op.buff, bytes, cudaMemcpyDeviceToDevice, op.stream), "cudaMemcpyAsync(group send snapshot)")) != ncclSuccess) return result;
-            if ((result = cudaCheck(runtime.cudaEventRecord(p.local_event, op.stream), "cudaEventRecord(group send ready)")) != ncclSuccess) return result;
+            if (bytes && (result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaMemcpyAsync, p.send_snapshot, op.buff, bytes, cudaMemcpyDeviceToDevice, op.stream))) != ncclSuccess) return result;
+            if ((result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaEventRecord, p.local_event, op.stream))) != ncclSuccess) return result;
             return ncclSuccess;
         }
         uint64_t const type_size = sizeofNcclDataType(op.datatype);
@@ -1174,20 +1169,20 @@ namespace nccl_fold {
         cudaEvent_t ready = NULL;
         void* source = NULL;
         bool temporary_source = false;
-        if ((result = openEvent(grouped.comm, p.ready.ready, &ready, "cudaIpcOpenEventHandle(group ready)")) != ncclSuccess) return result;
+        if ((result = openEvent(grouped.comm, p.ready.ready, &ready)) != ncclSuccess) return result;
         if (bytes && (result = importMemory(grouped.comm, op.peer, p.ready.memory, &source, &temporary_source)) != ncclSuccess) return result;
-        if ((result = cudaCheck(runtime.cudaStreamWaitEvent(op.stream, ready, 0), "cudaStreamWaitEvent(group ready)")) != ncclSuccess) return result;
-        if (bytes && (result = cudaCheck(runtime.cudaMemcpyAsync(op.buff, (char*)source + p.ready.memory.offset, bytes, cudaMemcpyDeviceToDevice, op.stream), "cudaMemcpyAsync(group P2P)")) != ncclSuccess) return result;
-        if (temporary_source && (result = cudaCheck(runtime.origCudaFreeAsync(source, op.stream), "cudaFreeAsync(imported group P2P pointer)")) != ncclSuccess) return result;
-        return cudaCheck(runtime.cudaEventRecord(p.local_event, op.stream), "cudaEventRecord(group recv done)");
+        if ((result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaStreamWaitEvent, op.stream, ready, 0))) != ncclSuccess) return result;
+        if (bytes && (result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaMemcpyAsync, op.buff, (char*)source + p.ready.memory.offset, bytes, cudaMemcpyDeviceToDevice, op.stream))) != ncclSuccess) return result;
+        if (temporary_source && (result = cudaToNccl(ATLC_LOG_CUDA(runtime.origCudaFreeAsync, source, op.stream))) != ncclSuccess) return result;
+        return cudaToNccl(ATLC_LOG_CUDA(runtime.cudaEventRecord, p.local_event, op.stream));
     }
 
     static ncclResult_t enqueuePreparedGroupSendCompletion(GroupOp const& grouped, PreparedGroupP2P const& p) {
         if (grouped.kind != GroupSend) return ncclSuccess;
         cudaEvent_t done = NULL;
-        ncclResult_t result = openEvent(grouped.comm, p.done.done, &done, "cudaIpcOpenEventHandle(group done)");
+        ncclResult_t result = openEvent(grouped.comm, p.done.done, &done);
         if (result != ncclSuccess) return result;
-        return cudaCheck(runtime.cudaStreamWaitEvent(grouped.p2p.stream, done, 0), "cudaStreamWaitEvent(group done)");
+        return cudaToNccl(ATLC_LOG_CUDA(runtime.cudaStreamWaitEvent, grouped.p2p.stream, done, 0));
     }
 
     struct CollectiveDescriptor {
@@ -1262,7 +1257,7 @@ namespace nccl_fold {
             size_t count, size_t source_offset, int nranks, ncclRedOp_t op, cudaStream_t stream) {
         if (count != 0) reductionKernel<T><<<(count + 255) / 256, 256, 0, stream>>>(
             (const void* const*)device_sources, (T*)output, count, source_offset, nranks, (int)op);
-        return cudaCheck(cudaGetLastError(), "reduction kernel launch");
+        return cudaToNccl(ATLC_LOG_CUDA(cudaGetLastError));
     }
 
     static ncclResult_t enqueueCollective(VirtualComm* comm, const CollectiveArgs& args) {
@@ -1309,8 +1304,8 @@ namespace nccl_fold {
         size_t ready_slot = 0;
         ncclResult_t result = leaseEvent(comm, &ready_slot, &ready);
         if (result != ncclSuccess) return result;
-        if ((result = cudaCheck(runtime.cudaEventRecord(ready, args.stream), "cudaEventRecord(collective ready)")) != ncclSuccess) return result;
-        if ((result = cudaCheck(runtime.cudaIpcGetEventHandle(&local.ready, ready), "cudaIpcGetEventHandle(collective ready)")) != ncclSuccess) return result;
+        if ((result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaEventRecord, ready, args.stream))) != ncclSuccess) return result;
+        if ((result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaIpcGetEventHandle, &local.ready, ready))) != ncclSuccess) return result;
 
         std::vector<CollectiveDescriptor> descriptors(comm->ndev);
         publishSnapshot(comm, DiagCollective, local.sequence, "collective-metadata", DiagWaiting,
@@ -1334,8 +1329,8 @@ namespace nccl_fold {
             if (rank == comm->rank) sources[rank] = const_cast<void*>(args.sendbuff);
             else if (source_bytes) {
                 cudaEvent_t event = NULL; void* base = NULL; bool temporary = false;
-                if ((result = openEvent(comm, d.ready, &event, "cudaIpcOpenEventHandle(collective ready)")) != ncclSuccess) return result;
-                if ((result = cudaCheck(runtime.cudaStreamWaitEvent(args.stream, event, 0), "cudaStreamWaitEvent(collective ready)")) != ncclSuccess) return result;
+                if ((result = openEvent(comm, d.ready, &event)) != ncclSuccess) return result;
+                if ((result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaStreamWaitEvent, args.stream, event, 0))) != ncclSuccess) return result;
                 if ((result = importMemory(comm, rank, d.memory, &base, &temporary)) != ncclSuccess) return result;
                 if (temporary) imported_pool_pointers.push_back(base);
                 sources[rank] = (char*)base + d.memory.offset;
@@ -1346,39 +1341,39 @@ namespace nccl_fold {
 
         if (args.kind == Broadcast) {
             if (source_bytes && args.recvbuff != sources[args.root])
-                result = cudaCheck(runtime.cudaMemcpyAsync(args.recvbuff, sources[args.root], source_bytes, cudaMemcpyDeviceToDevice, args.stream), "cudaMemcpyAsync(Broadcast)");
+                result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaMemcpyAsync, args.recvbuff, sources[args.root], source_bytes, cudaMemcpyDeviceToDevice, args.stream));
         } else if (args.kind == AllGather) {
             for (int rank = 0; rank < comm->ndev && result == ncclSuccess; ++rank) {
                 void* destination = (char*)args.recvbuff + rank * source_bytes;
-                if (source_bytes && destination != sources[rank]) result = cudaCheck(runtime.cudaMemcpyAsync(destination, sources[rank], source_bytes, cudaMemcpyDeviceToDevice, args.stream), "cudaMemcpyAsync(AllGather)");
+                if (source_bytes && destination != sources[rank]) result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaMemcpyAsync, destination, sources[rank], source_bytes, cudaMemcpyDeviceToDevice, args.stream));
             }
         } else if (args.kind == AlltoAll) {
             for (int rank = 0; rank < comm->ndev && result == ncclSuccess; ++rank) {
                 if (block_bytes) {
                     const void* source = (const char*)sources[rank] + (size_t)comm->rank * block_bytes;
                     void* destination = (char*)args.recvbuff + (size_t)rank * block_bytes;
-                    result = cudaCheck(runtime.cudaMemcpyAsync(destination, source, block_bytes, cudaMemcpyDeviceToDevice, args.stream), "cudaMemcpyAsync(AlltoAll)");
+                    result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaMemcpyAsync, destination, source, block_bytes, cudaMemcpyDeviceToDevice, args.stream));
                 }
             }
         } else if (args.kind == Gather) {
             if (comm->rank == args.root) {
                 for (int rank = 0; rank < comm->ndev && result == ncclSuccess; ++rank) {
                     void* destination = (char*)args.recvbuff + (size_t)rank * block_bytes;
-                    if (block_bytes && destination != sources[rank]) result = cudaCheck(runtime.cudaMemcpyAsync(destination, sources[rank], block_bytes, cudaMemcpyDeviceToDevice, args.stream), "cudaMemcpyAsync(Gather)");
+                    if (block_bytes && destination != sources[rank]) result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaMemcpyAsync, destination, sources[rank], block_bytes, cudaMemcpyDeviceToDevice, args.stream));
                 }
             }
         } else if (args.kind == Scatter) {
             if (block_bytes) {
                 const void* source = (const char*)sources[args.root] + (size_t)comm->rank * block_bytes;
-                if (args.recvbuff != source) result = cudaCheck(runtime.cudaMemcpyAsync(args.recvbuff, source, block_bytes, cudaMemcpyDeviceToDevice, args.stream), "cudaMemcpyAsync(Scatter)");
+                if (args.recvbuff != source) result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaMemcpyAsync, args.recvbuff, source, block_bytes, cudaMemcpyDeviceToDevice, args.stream));
             }
         } else if (args.kind != Reduce || comm->rank == args.root) {
             void** device_sources = NULL;
-            if ((result = cudaCheck(runtime.origCudaMallocAsync((void**)&device_sources, sizeof(void*) * comm->ndev, args.stream), "cudaMallocAsync(reduction sources)")) != ncclSuccess) return result;
+            if ((result = cudaToNccl(ATLC_LOG_CUDA(runtime.origCudaMallocAsync, (void**)&device_sources, sizeof(void*) * comm->ndev, args.stream))) != ncclSuccess) return result;
             ++comm->scratch_in_flight;
             ++comm->scratch_allocations_submitted;
             comm->scratch_high_water = std::max(comm->scratch_high_water, comm->scratch_in_flight);
-            result = cudaCheck(runtime.cudaMemcpyAsync(device_sources, sources.data(), sizeof(void*) * comm->ndev, cudaMemcpyHostToDevice, args.stream), "cudaMemcpyAsync(reduction sources)");
+            result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaMemcpyAsync, device_sources, sources.data(), sizeof(void*) * comm->ndev, cudaMemcpyHostToDevice, args.stream));
             if (result != ncclSuccess) {
                 if (runtime.origCudaFreeAsync(device_sources, args.stream) == cudaSuccess) --comm->scratch_in_flight;
                 return result;
@@ -1397,17 +1392,16 @@ namespace nccl_fold {
                 case ncclBfloat16: result=launchReduction<__nv_bfloat16>(device_sources,args.recvbuff,args.count,offset,comm->ndev,args.op,args.stream); break;
                 default: result=ncclInvalidArgument;
             }
-            cudaError_t free_error = runtime.origCudaFreeAsync(device_sources, args.stream);
+            cudaError_t free_error = ATLC_LOG_CUDA(runtime.origCudaFreeAsync, device_sources, args.stream);
             if (free_error == cudaSuccess) --comm->scratch_in_flight;
-            if (result == ncclSuccess) result = cudaCheck(free_error, "cudaFreeAsync(reduction sources)");
+            if (result == ncclSuccess) result = cudaToNccl(free_error);
         }
         if (result != ncclSuccess) return result;
 
         /* Pool imports are operation-scoped.  Queue each importing free after
          * its final read and before the done event exported below. */
         for (size_t i = 0; i < imported_pool_pointers.size(); ++i) {
-            result = cudaCheck(runtime.origCudaFreeAsync(imported_pool_pointers[i], args.stream),
-                               "cudaFreeAsync(imported collective pointer)");
+            result = cudaToNccl(ATLC_LOG_CUDA(runtime.origCudaFreeAsync, imported_pool_pointers[i], args.stream));
             if (result != ncclSuccess) return result;
         }
 
@@ -1417,16 +1411,16 @@ namespace nccl_fold {
         cudaEvent_t done = NULL;
         size_t done_slot = 0;
         if ((result = leaseEvent(comm, &done_slot, &done)) != ncclSuccess) return result;
-        if ((result = cudaCheck(runtime.cudaEventRecord(done, args.stream), "cudaEventRecord(collective done)")) != ncclSuccess) return result;
+        if ((result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaEventRecord, done, args.stream))) != ncclSuccess) return result;
         cudaIpcEventHandle_t local_done;
-        if ((result = cudaCheck(runtime.cudaIpcGetEventHandle(&local_done, done), "cudaIpcGetEventHandle(collective done)")) != ncclSuccess) return result;
+        if ((result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaIpcGetEventHandle, &local_done, done))) != ncclSuccess) return result;
         std::vector<cudaIpcEventHandle_t> dones(comm->ndev);
         if ((result = timedAllgather(&local_done, sizeof(local_done), MPI_BYTE, dones.data(), sizeof(local_done),
                 MPI_BYTE, comm, "collective-done", local.sequence)) != ncclSuccess) return result;
         for (int rank=0; rank<comm->ndev; ++rank) if (rank != comm->rank) {
             cudaEvent_t event = NULL;
-            if ((result = openEvent(comm, dones[rank], &event, "cudaIpcOpenEventHandle(collective done)")) != ncclSuccess) return result;
-            if ((result = cudaCheck(runtime.cudaStreamWaitEvent(args.stream, event, 0), "cudaStreamWaitEvent(collective done)")) != ncclSuccess) return result;
+            if ((result = openEvent(comm, dones[rank], &event)) != ncclSuccess) return result;
+            if ((result = cudaToNccl(ATLC_LOG_CUDA(runtime.cudaStreamWaitEvent, args.stream, event, 0))) != ncclSuccess) return result;
         }
         if ((result = timedBarrier(comm, comm->mpi_comm, "collective-done-leases", local.sequence)) != ncclSuccess) return result;
         releaseEvent(comm, done_slot);
@@ -1473,11 +1467,11 @@ namespace nccl_fold {
             if (operations[i].kind == GroupCollective) continue;
             MPI_Request request = MPI_REQUEST_NULL;
             GroupOp const& op = operations[i];
-            if ((result = mpiCheck(MPI_Isend(&op.p2p.sequence, 1, MPI_UINT64_T, op.p2p.peer,
-                    ackTag, op.comm->mpi_comm, &request), "MPI_Isend(group event ack)")) != ncclSuccess) return result;
+            if ((result = mpiToNccl(ATLC_LOG_MPI(MPI_Isend, &op.p2p.sequence, 1, MPI_UINT64_T, op.p2p.peer,
+                    ackTag, op.comm->mpi_comm, &request))) != ncclSuccess) return result;
             acknowledgements.push_back(request);
-            if ((result = mpiCheck(MPI_Irecv(&received[i], 1, MPI_UINT64_T, op.p2p.peer,
-                    ackTag, op.comm->mpi_comm, &request), "MPI_Irecv(group event ack)")) != ncclSuccess) return result;
+            if ((result = mpiToNccl(ATLC_LOG_MPI(MPI_Irecv, &received[i], 1, MPI_UINT64_T, op.p2p.peer,
+                    ackTag, op.comm->mpi_comm, &request))) != ncclSuccess) return result;
             acknowledgements.push_back(request);
         }
         if (!acknowledgements.empty()) {
